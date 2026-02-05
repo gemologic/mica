@@ -1,0 +1,7 @@
+[preset]
+name = "vlang"
+description = "V language environment"
+order = 10
+
+[packages]
+required = ["vlang"]

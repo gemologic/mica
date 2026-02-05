@@ -1,0 +1,8 @@
+[preset]
+name = "devops"
+description = "DevOps and infrastructure tools"
+order = 20
+
+[packages]
+required = ["kubectl", "hex", "terraform", "jq", "yq"]
+optional = ["kubectx", "awscli2", "google-cloud-sdk"]

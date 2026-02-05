@@ -1,0 +1,11 @@
+[preset]
+name = "python"
+description = "Python development environment"
+order = 10
+
+[packages]
+required = ["python3", "python3Packages.pip", "python3Packages.virtualenv"]
+optional = ["python3Packages.ipython", "python3Packages.black", "python3Packages.ruff", "python3Packages.mypy", "python3Packages.pytest", "uv"]
+
+[env]
+PYTHONDONTWRITEBYTECODE = "1"

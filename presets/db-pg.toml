@@ -1,0 +1,7 @@
+[preset]
+name = "db-pg"
+description = "PostgreSQL with pgvector"
+order = 20
+
+[packages]
+required = ["postgresql_18.withPackages (p: with p; [ pgvector ])"]

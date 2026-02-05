@@ -1,0 +1,7 @@
+[preset]
+name = "nim"
+description = "Nim development environment"
+order = 10
+
+[packages]
+required = ["nim", "nimble"]

@@ -1,0 +1,11 @@
+[preset]
+name = "go"
+description = "Go development environment"
+order = 10
+
+[packages]
+required = ["go", "gopls", "gotools"]
+optional = ["golangci-lint", "delve", "go-migrate"]
+
+[env]
+CGO_ENABLED = "0"

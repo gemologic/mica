@@ -1,0 +1,7 @@
+[preset]
+name = "crystal"
+description = "Crystal development environment"
+order = 10
+
+[packages]
+required = ["crystal", "shards"]

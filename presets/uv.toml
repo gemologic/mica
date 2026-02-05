@@ -1,0 +1,22 @@
+[preset]
+name = "uv"
+description = "Python with uv-nix environment"
+order = 10
+
+[packages]
+required = ["uv", "uvEnv"]
+
+[nix]
+let = '''
+uvEnv = pkgs.uv-nix.mkEnv {
+  python = pkgs.python313;
+  workspaceRoot = pkgs.hax.filterSrc { path = ./.; };
+  pyprojectOverrides = final: prev: { };
+};
+'''
+override_merge = '''
+// uvEnv.uvEnvVars
+'''
+override_shellhook = '''
+${uvEnv.shellHook or ""}
+'''

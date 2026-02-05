@@ -1,0 +1,7 @@
+[preset]
+name = "ruby"
+description = "Ruby development environment"
+order = 10
+
+[packages]
+required = ["ruby_3_2", "sqlite"]

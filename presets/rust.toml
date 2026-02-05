@@ -1,0 +1,33 @@
+[preset]
+name = "rust"
+description = "Rust development environment"
+order = 10
+
+[packages]
+required = ["rustc", "cargo", "rust-analyzer", "rustfmt", "clippy"]
+optional = ["cargo-watch", "cargo-edit", "cargo-expand", "cargo-audit", "bacon", "mold"]
+
+[env]
+RUST_BACKTRACE = "1"
+
+[nix]
+pins = '''
+, _rust ? import (fetchTarball {
+    name = "oxalica-2026-01-21";
+    url = "https://github.com/oxalica/rust-overlay/archive/2ef5b3362af585a83bafd34e7fc9b1f388c2e5e2.tar.gz";
+    sha256 = "138a0p83qzflw8wj4a7cainqanjmvjlincx8imr3yq1b924lg9cz";
+  }) {}
+'''
+let = '''
+  pkgs = pkgs.extend _rust;
+  target = "x86_64-unknown-linux-musl";
+  rust = pkgs.rust-bin.selectLatestNightlyWith (toolchain: toolchain.default.override {
+    extensions = [ "rust-src" "rustc-dev" "rust-analyzer" ];
+    targets = [ target ];
+  });
+'''
+scripts = '''
+  build_static = writers.writeBashBin "build_static" ''
+    cargo zigbuild --release --target "x86_64-unknown-linux-musl"
+  '';
+'''

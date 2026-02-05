@@ -1,0 +1,7 @@
+[preset]
+name = "db-redis"
+description = "Redis server and CLI"
+order = 20
+
+[packages]
+required = ["redis"]

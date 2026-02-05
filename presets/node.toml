@@ -1,0 +1,8 @@
+[preset]
+name = "node"
+description = "Node.js development environment"
+order = 10
+
+[packages]
+required = ["nodejs", "nodePackages.npm"]
+optional = ["nodePackages.pnpm", "yarn", "nodePackages.typescript", "nodePackages.ts-node"]

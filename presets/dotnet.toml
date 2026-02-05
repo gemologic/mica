@@ -1,0 +1,15 @@
+[preset]
+name = "dotnet"
+description = ".NET SDK and tooling"
+order = 10
+
+[packages]
+required = ["clang", "dotnet-sdk_9", "dotnet-runtime_9", "dotnetPackages.Nuget", "netcoredbg", "zlib"]
+
+[env]
+DOTNET_CLI_TELEMETRY_OPTOUT = "1"
+
+[nix]
+env_raw = '''
+DOTNET_ROOT = "${pkgs.dotnet-sdk_9}";
+'''

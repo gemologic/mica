@@ -1,0 +1,7 @@
+[preset]
+name = "php"
+description = "PHP development environment"
+order = 10
+
+[packages]
+required = ["php83"]

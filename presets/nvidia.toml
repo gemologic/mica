@@ -1,0 +1,16 @@
+[preset]
+name = "nvidia"
+description = "Nvidia runtime library path helpers"
+order = 20
+
+[packages]
+required = ["deps"]
+
+[nix]
+let = '''
+deps = with pkgs; [ stdenv.cc.cc.lib ] ++ (with cudaPackages; [ cudatoolkit ]);
+'''
+env_raw = '''
+LD_LIBRARY_PATH = "${pkgs.hax.nvidiaLdPath}:${pkgs.lib.makeLibraryPath deps}";
+CUDA_PATH = pkgs.cudatoolkit;
+'''

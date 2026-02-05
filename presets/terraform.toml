@@ -1,0 +1,7 @@
+[preset]
+name = "terraform"
+description = "Terraform tooling"
+order = 20
+
+[packages]
+required = ["terraform", "terraform-ls", "terrascan", "tfsec"]

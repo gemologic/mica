@@ -1,0 +1,7 @@
+[preset]
+name = "elixir"
+description = "Elixir and Erlang tooling"
+order = 10
+
+[packages]
+required = ["elixir", "beamPackages.hex", "inotify-tools"]

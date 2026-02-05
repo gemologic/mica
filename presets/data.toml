@@ -1,0 +1,8 @@
+[preset]
+name = "data"
+description = "Data engineering and analysis tools"
+order = 20
+
+[packages]
+required = ["duckdb", "sqlite", "jq", "miller"]
+optional = ["postgresql", "clickhouse", "xsv", "htmlq", "pup"]

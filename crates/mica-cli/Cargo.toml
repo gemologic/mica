@@ -1,0 +1,22 @@
+[package]
+name = "mica"
+version = "0.1.0"
+edition = { workspace = true }
+license = { workspace = true }
+
+[dependencies]
+mica-core = { path = "../mica-core" }
+mica-index = { path = "../mica-index" }
+clap = { workspace = true }
+chrono = { workspace = true }
+crossterm = { workspace = true }
+ratatui = { workspace = true }
+thiserror = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+rusqlite = { workspace = true }
+rnix = { workspace = true }
+
+[[bin]]
+name = "mica"
+path = "src/main.rs"
