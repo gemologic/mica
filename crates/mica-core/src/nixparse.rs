@@ -1,9 +1,9 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use chrono::NaiveDate;
 
-use crate::state::{NixBlocks, Pin};
+use crate::state::{NixBlocks, Pin, PinnedPackage, NIX_EXPR_PREFIX};
 
 #[derive(Debug)]
 pub enum ParseError {
@@ -139,6 +139,7 @@ pub struct ParsedProjectState {
     pub pin: Pin,
     pub pins: BTreeMap<String, Pin>,
     pub packages: Vec<String>,
+    pub pinned: BTreeMap<String, PinnedPackage>,
     pub env: BTreeMap<String, String>,
     pub shell_hook: Option<String>,
     pub presets: Vec<String>,
@@ -149,19 +150,25 @@ pub struct ParsedProjectState {
 pub struct ParsedProfileState {
     pub pin: Pin,
     pub packages: Vec<String>,
+    pub pinned: BTreeMap<String, PinnedPackage>,
 }
 
 pub fn parse_project_state_from_nix(content: &str) -> Result<ParsedProjectState, StateParseError> {
     let parsed = parse_nix_file(content)?;
     let pin = parse_pin_section(&parsed.pin_section)?;
-    let (pins, pins_block) = parse_pin_args(parsed.pins_section.as_deref());
-    let (packages, presets) = parse_package_list(&parsed.packages_section);
+    let (mut pins, pins_block) = parse_pin_args(parsed.pins_section.as_deref());
+    let (packages, presets, pinned, pinned_pin_names) =
+        parse_package_list(&parsed.packages_section, &pins);
+    for name in pinned_pin_names {
+        pins.remove(&name);
+    }
     let env = parse_env_section(&parsed.env_section);
     let shell_hook = parse_shell_hook(&parsed.shell_hook_section);
     Ok(ParsedProjectState {
         pin,
         pins,
         packages,
+        pinned,
         env,
         shell_hook,
         presets,
@@ -181,8 +188,13 @@ pub fn parse_project_state_from_nix(content: &str) -> Result<ParsedProjectState,
 pub fn parse_profile_state_from_nix(content: &str) -> Result<ParsedProfileState, StateParseError> {
     let parsed = parse_profile_nix(content)?;
     let pin = parse_pin_section(&parsed.pins_section)?;
-    let packages = parse_profile_paths(&parsed.paths_section);
-    Ok(ParsedProfileState { pin, packages })
+    let pinned_pins = parse_profile_pins(&parsed.pins_section);
+    let (packages, pinned) = parse_profile_paths(&parsed.paths_section, &pinned_pins);
+    Ok(ParsedProfileState {
+        pin,
+        packages,
+        pinned,
+    })
 }
 
 fn parse_pin_section(section: &str) -> Result<Pin, StateParseError> {
@@ -278,6 +290,58 @@ fn parse_pin_args(section: Option<&str>) -> (BTreeMap<String, Pin>, Option<Strin
     }
 }
 
+fn parse_profile_pins(section: &str) -> BTreeMap<String, Pin> {
+    let mut pins = BTreeMap::new();
+    let mut current: Option<String> = None;
+    let mut current_name: Option<String> = None;
+    let mut current_url: Option<String> = None;
+    let mut current_sha: Option<String> = None;
+
+    for line in section.lines() {
+        let trimmed = line.trim();
+        if current.is_none() {
+            if trimmed.starts_with("pkgs-") && trimmed.contains("= import (fetchTarball") {
+                if let Some((name, _)) = trimmed.split_once('=') {
+                    current = Some(name.trim().to_string());
+                    current_name = None;
+                    current_url = None;
+                    current_sha = None;
+                }
+            }
+            continue;
+        }
+
+        if let Some(rest) = trimmed.strip_prefix("name =") {
+            current_name = Some(trim_quotes(rest.trim_end_matches(';').trim()));
+        }
+        if let Some(rest) = trimmed.strip_prefix("url =") {
+            current_url = Some(trim_quotes(rest.trim_end_matches(';').trim()));
+        }
+        if let Some(rest) = trimmed.strip_prefix("sha256 =") {
+            current_sha = Some(trim_quotes(rest.trim_end_matches(';').trim()));
+        }
+
+        if trimmed.starts_with("})") {
+            if let (Some(name), Some(url), Some(sha256)) =
+                (current.take(), current_url.take(), current_sha.take())
+            {
+                let rev = extract_rev_from_url(&url).unwrap_or_default();
+                let pin = Pin {
+                    name: current_name.take(),
+                    url: trim_archive_url(&url),
+                    rev,
+                    sha256,
+                    branch: String::new(),
+                    updated: NaiveDate::from_ymd_opt(1970, 1, 1).unwrap(),
+                };
+                pins.insert(name, pin);
+            }
+        }
+    }
+
+    pins
+}
+
 fn find_attr_value(section: &str, key: &str) -> Option<String> {
     for line in section.lines() {
         let line = line.trim();
@@ -317,9 +381,19 @@ fn normalize_package_name(value: &str) -> String {
         .to_string()
 }
 
-fn parse_package_list(section: &str) -> (Vec<String>, Vec<String>) {
+fn parse_package_list(
+    section: &str,
+    pins: &BTreeMap<String, Pin>,
+) -> (
+    Vec<String>,
+    Vec<String>,
+    BTreeMap<String, PinnedPackage>,
+    BTreeSet<String>,
+) {
     let mut packages = Vec::new();
     let mut presets = Vec::new();
+    let mut pinned = BTreeMap::new();
+    let mut pinned_pin_names = BTreeSet::new();
     let mut in_raw_block = false;
     for line in section.lines() {
         let trimmed = line.trim();
@@ -349,17 +423,42 @@ fn parse_package_list(section: &str) -> (Vec<String>, Vec<String>) {
         {
             continue;
         }
-        let item = trimmed.trim_end_matches(',').trim();
+        let raw_item = trimmed.trim_end_matches(',').trim();
+        let (item, comment) = match raw_item.split_once('#') {
+            Some((left, right)) => (left.trim(), Some(right.trim().to_string())),
+            None => (raw_item, None),
+        };
         if item.starts_with('#') || item.is_empty() {
             continue;
         }
+        if let Some((prefix, attr)) = item.split_once('.') {
+            if prefix.starts_with("pkgs-") {
+                if let Some(pin) = pins.get(prefix) {
+                    let name = normalize_package_name(attr);
+                    let version = comment.unwrap_or_else(|| "unknown".to_string());
+                    pinned.insert(
+                        name,
+                        PinnedPackage {
+                            version,
+                            pin: pin.clone(),
+                        },
+                    );
+                    pinned_pin_names.insert(prefix.to_string());
+                    continue;
+                }
+            }
+        }
         packages.push(normalize_package_name(item));
     }
-    (packages, presets)
+    (packages, presets, pinned, pinned_pin_names)
 }
 
-fn parse_profile_paths(section: &str) -> Vec<String> {
+fn parse_profile_paths(
+    section: &str,
+    pins: &BTreeMap<String, Pin>,
+) -> (Vec<String>, BTreeMap<String, PinnedPackage>) {
     let mut packages = Vec::new();
+    let mut pinned = BTreeMap::new();
     for line in section.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
@@ -368,12 +467,32 @@ fn parse_profile_paths(section: &str) -> Vec<String> {
         if trimmed.contains("paths =") || trimmed == "[" || trimmed == "];" {
             continue;
         }
-        let item = trimmed.trim_end_matches(',').trim();
+        let raw_item = trimmed.trim_end_matches(',').trim();
+        let (item, comment) = match raw_item.split_once('#') {
+            Some((left, right)) => (left.trim(), Some(right.trim().to_string())),
+            None => (raw_item, None),
+        };
+        if let Some((prefix, attr)) = item.split_once('.') {
+            if prefix.starts_with("pkgs-") {
+                if let Some(pin) = pins.get(prefix) {
+                    let name = normalize_package_name(attr);
+                    let version = comment.unwrap_or_else(|| "unknown".to_string());
+                    pinned.insert(
+                        name,
+                        PinnedPackage {
+                            version,
+                            pin: pin.clone(),
+                        },
+                    );
+                    continue;
+                }
+            }
+        }
         if let Some(attr) = item.strip_prefix("pkgs.") {
             packages.push(attr.to_string());
         }
     }
-    packages
+    (packages, pinned)
 }
 
 fn parse_env_section(section: &str) -> BTreeMap<String, String> {
@@ -398,10 +517,54 @@ fn parse_env_section(section: &str) -> BTreeMap<String, String> {
         if let Some((key, value)) = trimmed.split_once('=') {
             let key = key.trim();
             let value = value.trim().trim_end_matches(';').trim();
-            env.insert(key.to_string(), trim_quotes(value));
+            env.insert(key.to_string(), parse_env_value(value));
         }
     }
     env
+}
+
+fn parse_env_value(value: &str) -> String {
+    let trimmed = value.trim();
+    if is_quoted_nix_expression(trimmed) {
+        return format!("{}{}", NIX_EXPR_PREFIX, trimmed);
+    }
+    if is_indented_string_literal(trimmed) {
+        return format!("{}{}", NIX_EXPR_PREFIX, trimmed);
+    }
+    if is_unquoted_nix_expression(trimmed) {
+        return format!("{}{}", NIX_EXPR_PREFIX, trimmed);
+    }
+    trim_quotes(trimmed)
+}
+
+fn is_quoted_nix_expression(value: &str) -> bool {
+    let trimmed = value.trim();
+    trimmed.len() >= 2
+        && trimmed.starts_with('\"')
+        && trimmed.ends_with('\"')
+        && contains_unescaped_interpolation(trimmed)
+}
+
+fn contains_unescaped_interpolation(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let mut idx = 0usize;
+    while idx + 1 < bytes.len() {
+        if bytes[idx] == b'$' && bytes[idx + 1] == b'{' && (idx == 0 || bytes[idx - 1] != b'\\') {
+            return true;
+        }
+        idx += 1;
+    }
+    false
+}
+
+fn is_indented_string_literal(value: &str) -> bool {
+    value.len() >= 4 && value.starts_with("''") && value.ends_with("''")
+}
+
+fn is_unquoted_nix_expression(value: &str) -> bool {
+    !(value.is_empty()
+        || (value.starts_with('\"') && value.ends_with('\"'))
+        || (value.starts_with("''") && value.ends_with("''")))
 }
 
 fn parse_shell_hook(section: &str) -> Option<String> {
@@ -599,4 +762,65 @@ fn normalize_optional_block(block: Option<String>) -> Option<String> {
     }
 
     Some(normalized.trim_end_matches('\n').to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::nixparse::parse_env_section;
+    use crate::state::NIX_EXPR_PREFIX;
+
+    #[test]
+    fn parse_env_section_keeps_interpolated_nix_string_expressions() {
+        let env = parse_env_section(
+            r#"
+            MICA_A = "${pkgs.path}/meme";
+            "#,
+        );
+        let expected = format!("{}\"${{pkgs.path}}/meme\"", NIX_EXPR_PREFIX);
+
+        assert_eq!(
+            env.get("MICA_A").map(String::as_str),
+            Some(expected.as_str())
+        );
+    }
+
+    #[test]
+    fn parse_env_section_trims_plain_quoted_values() {
+        let env = parse_env_section(
+            r#"
+            MICA_A = "hello";
+            "#,
+        );
+
+        assert_eq!(env.get("MICA_A").map(String::as_str), Some("hello"));
+    }
+
+    #[test]
+    fn parse_env_section_keeps_unquoted_nix_expressions() {
+        let env = parse_env_section(
+            r#"
+            MICA_A = pkgs.path + "/meme";
+            "#,
+        );
+        let expected = format!("{}pkgs.path + \"/meme\"", NIX_EXPR_PREFIX);
+
+        assert_eq!(
+            env.get("MICA_A").map(String::as_str),
+            Some(expected.as_str())
+        );
+    }
+
+    #[test]
+    fn parse_env_section_keeps_escaped_interpolation_as_plain_string() {
+        let env = parse_env_section(
+            r#"
+            MICA_A = "\${HOME}/mica";
+            "#,
+        );
+
+        assert_eq!(
+            env.get("MICA_A").map(String::as_str),
+            Some("\\${HOME}/mica")
+        );
+    }
 }

@@ -13,11 +13,14 @@ pub enum InputAction {
     Clear,
     Help,
     ShowPackageInfo,
+    OpenVersionPicker,
     OpenEnv,
     OpenShell,
     ToggleBroken,
     ToggleInsecure,
     ToggleInstalled,
+    ToggleSearchMode,
+    ToggleDetails,
     EditLicenseFilter,
     EditPlatformFilter,
     PreviewDiff,
@@ -45,11 +48,16 @@ pub fn map_key(event: KeyEvent) -> InputAction {
         KeyCode::Char('p') if event.modifiers.contains(KeyModifiers::CONTROL) => {
             InputAction::ShowPackageInfo
         }
+        KeyCode::Char('v') if event.modifiers.contains(KeyModifiers::CONTROL) => {
+            InputAction::OpenVersionPicker
+        }
         KeyCode::Char('E') => InputAction::OpenEnv,
         KeyCode::Char('H') => InputAction::OpenShell,
         KeyCode::Char('B') => InputAction::ToggleBroken,
         KeyCode::Char('I') => InputAction::ToggleInsecure,
         KeyCode::Char('V') => InputAction::ToggleInstalled,
+        KeyCode::Char('S') => InputAction::ToggleSearchMode,
+        KeyCode::Char('K') => InputAction::ToggleDetails,
         KeyCode::Char('L') => InputAction::EditLicenseFilter,
         KeyCode::Char('O') => InputAction::EditPlatformFilter,
         KeyCode::Char('D') => InputAction::PreviewDiff,

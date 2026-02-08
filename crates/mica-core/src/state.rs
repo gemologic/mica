@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
 
+pub const NIX_EXPR_PREFIX: &str = "__mica_nix_expr__:";
+
 #[derive(Debug, thiserror::Error)]
 pub enum StateError {
     #[error("failed to read state file: {0}")]

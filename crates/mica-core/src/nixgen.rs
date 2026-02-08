@@ -1,7 +1,7 @@
 use crate::preset::{MergedProfileResult, MergedResult};
-use crate::state::{GlobalProfileState, ProjectState};
+use crate::state::{GlobalProfileState, PinnedPackage, ProjectState, NIX_EXPR_PREFIX};
 use chrono::{DateTime, Utc};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 pub fn generate_project_nix(
     state: &ProjectState,
@@ -32,6 +32,7 @@ pub fn generate_project_nix(
     output.push_str("  }) {}\n");
     output.push_str("  # mica:pins:begin\n");
     let state_pin_names: HashSet<String> = state.pins.keys().cloned().collect();
+    let pinned_var_names = build_pinned_var_names(&state.packages.pinned);
     for (name, pin) in &state.pins {
         let name = sanitize_nix_identifier(name);
         output.push_str(&format!("  , {} ? import (fetchTarball {{\n", name));
@@ -46,6 +47,25 @@ pub fn generate_project_nix(
             pin.url, pin.rev
         ));
         output.push_str(&format!("      sha256 = \"{}\";\n", pin.sha256));
+        output.push_str("    }) {}\n");
+    }
+    for (attr, pinned) in &state.packages.pinned {
+        let var_name = pinned_var_names
+            .get(attr)
+            .cloned()
+            .unwrap_or_else(|| sanitize_var_name(attr));
+        output.push_str(&format!(
+            "  , pkgs-{} ? import (fetchTarball {{\n",
+            var_name
+        ));
+        if let Some(name) = &pinned.pin.name {
+            output.push_str(&format!("      name = \"{}\";\n", escape_nix_string(name)));
+        }
+        output.push_str(&format!(
+            "      url = \"{}/archive/{}.tar.gz\";\n",
+            pinned.pin.url, pinned.pin.rev
+        ));
+        output.push_str(&format!("      sha256 = \"{}\";\n", pinned.pin.sha256));
         output.push_str("    }) {}\n");
     }
     let mut filtered_pin_blocks = Vec::new();
@@ -89,6 +109,19 @@ pub fn generate_project_nix(
             output.push_str(&format!("    {}\n", pkg));
         }
     }
+    if !state.packages.pinned.is_empty() {
+        output.push_str("    # Pinned packages\n");
+        for (attr, pinned) in &state.packages.pinned {
+            let var_name = pinned_var_names
+                .get(attr)
+                .cloned()
+                .unwrap_or_else(|| sanitize_var_name(attr));
+            output.push_str(&format!(
+                "    pkgs-{}.{}  # {}\n",
+                var_name, attr, pinned.version
+            ));
+        }
+    }
     output.push_str("    # mica:packages-raw:begin\n");
     write_blocks(&mut output, "    ", &merged.packages_raw_blocks);
     output.push_str("    # mica:packages-raw:end\n");
@@ -99,7 +132,7 @@ pub fn generate_project_nix(
     output.push_str("    inherit name paths; buildInputs = paths;\n");
     output.push_str("    # mica:env:begin\n");
     for (key, value) in &merged.env {
-        output.push_str(&format!("    {} = \"{}\";\n", key, value));
+        output.push_str(&format!("    {} = {};\n", key, render_nix_env_value(value)));
     }
     output.push_str("    # mica:env-raw:begin\n");
     write_blocks(&mut output, "    ", &merged.env_raw_blocks);
@@ -154,6 +187,33 @@ fn escape_nix_string(value: &str) -> String {
     out
 }
 
+fn render_nix_env_value(value: &str) -> String {
+    if let Some(raw_expression) = value.strip_prefix(NIX_EXPR_PREFIX) {
+        return render_raw_nix_expression(raw_expression);
+    }
+    if is_nix_expression_literal(value) {
+        return value.trim().to_string();
+    }
+    format!("\"{}\"", escape_nix_string(value))
+}
+
+fn render_raw_nix_expression(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return "\"\"".to_string();
+    }
+    if trimmed.starts_with("${") {
+        return format!("\"{}\"", trimmed);
+    }
+    trimmed.to_string()
+}
+
+fn is_nix_expression_literal(value: &str) -> bool {
+    let trimmed = value.trim();
+    (trimmed.len() >= 2 && trimmed.starts_with('\"') && trimmed.ends_with('\"'))
+        || (trimmed.len() >= 4 && trimmed.starts_with("''") && trimmed.ends_with("''"))
+}
+
 pub fn generate_profile_nix(
     state: &GlobalProfileState,
     merged: &MergedProfileResult,
@@ -181,8 +241,12 @@ pub fn generate_profile_nix(
     ));
     output.push_str(&format!("    sha256 = \"{}\";\n", state.pin.sha256));
     output.push_str("  }) {};\n");
+    let pinned_var_names = build_pinned_var_names(&state.packages.pinned);
     for (attr, pinned) in &state.packages.pinned {
-        let var_name = sanitize_var_name(attr);
+        let var_name = pinned_var_names
+            .get(attr)
+            .cloned()
+            .unwrap_or_else(|| sanitize_var_name(attr));
         output.push_str(&format!("\n  # Pin for {}\n", attr));
         output.push_str(&format!("  pkgs-{} = import (fetchTarball {{\n", var_name));
         if let Some(name) = &pinned.pin.name {
@@ -215,7 +279,10 @@ pub fn generate_profile_nix(
         }
     }
     for (attr, pinned) in &state.packages.pinned {
-        let var_name = sanitize_var_name(attr);
+        let var_name = pinned_var_names
+            .get(attr)
+            .cloned()
+            .unwrap_or_else(|| sanitize_var_name(attr));
         output.push_str(&format!(
             "    pkgs-{}.{}  # {}\n",
             var_name, attr, pinned.version
@@ -232,6 +299,23 @@ pub fn generate_profile_nix(
 
 fn sanitize_var_name(name: &str) -> String {
     sanitize_nix_identifier(name)
+}
+
+fn build_pinned_var_names(pinned: &BTreeMap<String, PinnedPackage>) -> BTreeMap<String, String> {
+    let mut mapping = BTreeMap::new();
+    let mut used = HashSet::new();
+    for attr in pinned.keys() {
+        let base = sanitize_var_name(attr);
+        let mut candidate = base.clone();
+        let mut idx = 2usize;
+        while used.contains(&candidate) {
+            candidate = format!("{}_{}", base, idx);
+            idx += 1;
+        }
+        used.insert(candidate.clone());
+        mapping.insert(attr.clone(), candidate);
+    }
+    mapping
 }
 
 fn sanitize_nix_identifier(name: &str) -> String {
@@ -280,5 +364,251 @@ fn write_blocks(output: &mut String, indent: &str, blocks: &[String]) {
             output.push_str(line);
             output.push('\n');
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::nixgen::{generate_profile_nix, generate_project_nix};
+    use crate::preset::{MergedProfileResult, MergedResult};
+    use crate::state::{
+        GenerationsState, GlobalProfileState, MicaMetadata, PackagesState, Pin, PinnedPackage,
+        PresetState, ProjectState, ShellState, NIX_EXPR_PREFIX,
+    };
+    use chrono::{DateTime, NaiveDate, Utc};
+    use std::collections::BTreeMap;
+
+    fn timestamp() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-02-06T00:00:00Z")
+            .expect("timestamp parse failed")
+            .with_timezone(&Utc)
+    }
+
+    fn date() -> NaiveDate {
+        NaiveDate::from_ymd_opt(2026, 2, 6).expect("date parse failed")
+    }
+
+    fn base_pin() -> Pin {
+        Pin {
+            name: None,
+            url: "https://github.com/NixOS/nixpkgs".to_string(),
+            rev: "deadbeef".to_string(),
+            sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123".to_string(),
+            branch: "main".to_string(),
+            updated: date(),
+        }
+    }
+
+    fn pinned_packages() -> BTreeMap<String, PinnedPackage> {
+        let pin = base_pin();
+        BTreeMap::from([
+            (
+                "foo-bar".to_string(),
+                PinnedPackage {
+                    version: "1.0.0".to_string(),
+                    pin: pin.clone(),
+                },
+            ),
+            (
+                "foo_bar".to_string(),
+                PinnedPackage {
+                    version: "2.0.0".to_string(),
+                    pin,
+                },
+            ),
+        ])
+    }
+
+    fn empty_merged_result() -> MergedResult {
+        MergedResult {
+            preset_packages: Vec::new(),
+            user_packages: Vec::new(),
+            env: BTreeMap::new(),
+            shell_hooks: Vec::new(),
+            all_packages: Vec::new(),
+            let_blocks: Vec::new(),
+            pin_blocks: Vec::new(),
+            packages_raw_blocks: Vec::new(),
+            scripts_blocks: Vec::new(),
+            env_raw_blocks: Vec::new(),
+            override_blocks: Vec::new(),
+            override_merge_blocks: Vec::new(),
+            override_shellhook_blocks: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn project_generation_uses_unique_vars_for_colliding_pinned_attrs() {
+        let state = ProjectState {
+            mica: MicaMetadata {
+                version: "0.1.0".to_string(),
+                created: timestamp(),
+                modified: timestamp(),
+            },
+            pin: base_pin(),
+            pins: BTreeMap::new(),
+            presets: PresetState::default(),
+            packages: PackagesState {
+                added: Vec::new(),
+                removed: Vec::new(),
+                pinned: pinned_packages(),
+            },
+            env: BTreeMap::new(),
+            shell: ShellState::default(),
+            nix: Default::default(),
+        };
+
+        let output = generate_project_nix(
+            &state,
+            &empty_merged_result(),
+            "collision-test",
+            timestamp(),
+        );
+
+        assert!(output.contains("  , pkgs-foo_bar ? import (fetchTarball {"));
+        assert!(output.contains("  , pkgs-foo_bar_2 ? import (fetchTarball {"));
+        assert!(output.contains("    pkgs-foo_bar.foo-bar  # 1.0.0"));
+        assert!(output.contains("    pkgs-foo_bar_2.foo_bar  # 2.0.0"));
+    }
+
+    #[test]
+    fn profile_generation_uses_unique_vars_for_colliding_pinned_attrs() {
+        let state = GlobalProfileState {
+            mica: MicaMetadata {
+                version: "0.1.0".to_string(),
+                created: timestamp(),
+                modified: timestamp(),
+            },
+            pin: base_pin(),
+            presets: PresetState::default(),
+            packages: PackagesState {
+                added: Vec::new(),
+                removed: Vec::new(),
+                pinned: pinned_packages(),
+            },
+            generations: GenerationsState::default(),
+        };
+        let merged = MergedProfileResult {
+            preset_packages: Vec::new(),
+            user_packages: Vec::new(),
+            all_packages: Vec::new(),
+        };
+
+        let output = generate_profile_nix(&state, &merged, timestamp());
+
+        assert!(output.contains("  pkgs-foo_bar = import (fetchTarball {"));
+        assert!(output.contains("  pkgs-foo_bar_2 = import (fetchTarball {"));
+        assert!(output.contains("    pkgs-foo_bar.foo-bar  # 1.0.0"));
+        assert!(output.contains("    pkgs-foo_bar_2.foo_bar  # 2.0.0"));
+    }
+
+    #[test]
+    fn project_generation_escapes_plain_env_values() {
+        let state = ProjectState {
+            mica: MicaMetadata {
+                version: "0.1.0".to_string(),
+                created: timestamp(),
+                modified: timestamp(),
+            },
+            pin: base_pin(),
+            pins: BTreeMap::new(),
+            presets: PresetState::default(),
+            packages: PackagesState::default(),
+            env: BTreeMap::new(),
+            shell: ShellState::default(),
+            nix: Default::default(),
+        };
+
+        let mut merged = empty_merged_result();
+        merged
+            .env
+            .insert("MICA_TEST".to_string(), "${HOME}/mica".to_string());
+
+        let output = generate_project_nix(&state, &merged, "env-test", timestamp());
+
+        assert!(output.contains("MICA_TEST = \"\\${HOME}/mica\";"));
+    }
+
+    #[test]
+    fn project_generation_preserves_nix_expression_env_values() {
+        let state = ProjectState {
+            mica: MicaMetadata {
+                version: "0.1.0".to_string(),
+                created: timestamp(),
+                modified: timestamp(),
+            },
+            pin: base_pin(),
+            pins: BTreeMap::new(),
+            presets: PresetState::default(),
+            packages: PackagesState::default(),
+            env: BTreeMap::new(),
+            shell: ShellState::default(),
+            nix: Default::default(),
+        };
+
+        let mut merged = empty_merged_result();
+        merged
+            .env
+            .insert("MICA_TEST".to_string(), "\"${pkgs.path}/meme\"".to_string());
+
+        let output = generate_project_nix(&state, &merged, "env-test", timestamp());
+
+        assert!(output.contains("MICA_TEST = \"${pkgs.path}/meme\";"));
+    }
+
+    #[test]
+    fn project_generation_renders_prefixed_nix_expression_values_raw() {
+        let state = ProjectState {
+            mica: MicaMetadata {
+                version: "0.1.0".to_string(),
+                created: timestamp(),
+                modified: timestamp(),
+            },
+            pin: base_pin(),
+            pins: BTreeMap::new(),
+            presets: PresetState::default(),
+            packages: PackagesState::default(),
+            env: BTreeMap::new(),
+            shell: ShellState::default(),
+            nix: Default::default(),
+        };
+
+        let mut merged = empty_merged_result();
+        merged.env.insert(
+            "MICA_TEST".to_string(),
+            format!("{}pkgs.path + \"/meme\"", NIX_EXPR_PREFIX),
+        );
+
+        let output = generate_project_nix(&state, &merged, "env-test", timestamp());
+
+        assert!(output.contains("MICA_TEST = pkgs.path + \"/meme\";"));
+    }
+
+    #[test]
+    fn project_generation_wraps_prefixed_interpolation_fragment_as_nix_string() {
+        let state = ProjectState {
+            mica: MicaMetadata {
+                version: "0.1.0".to_string(),
+                created: timestamp(),
+                modified: timestamp(),
+            },
+            pin: base_pin(),
+            pins: BTreeMap::new(),
+            presets: PresetState::default(),
+            packages: PackagesState::default(),
+            env: BTreeMap::new(),
+            shell: ShellState::default(),
+            nix: Default::default(),
+        };
+
+        let mut merged = empty_merged_result();
+        merged.env.insert(
+            "MICA_TEST".to_string(),
+            format!("{}${{pkgs.path}}/meme", NIX_EXPR_PREFIX),
+        );
+
+        let output = generate_project_nix(&state, &merged, "env-test", timestamp());
+
+        assert!(output.contains("MICA_TEST = \"${pkgs.path}/meme\";"));
     }
 }

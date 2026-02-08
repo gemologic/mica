@@ -30,6 +30,7 @@ let
     cli = [
       jfmt
     ];
+    node = [ bun ];
     rust = [
       cargo-zigbuild
       rust
@@ -65,7 +66,6 @@ let
       cp target/${target}/release/${name} $out/bin/
     '';
   });
-
 in
 (env.overrideAttrs (_: {
   inherit name;

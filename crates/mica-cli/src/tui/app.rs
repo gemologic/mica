@@ -1,3 +1,5 @@
+use mica_core::config::SearchMode;
+use mica_core::state::{Pin, PinnedPackage};
 use ratatui::widgets::{ListState, TableState};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
@@ -56,6 +58,7 @@ pub struct PresetEntry {
     pub description: String,
     pub order: i32,
     pub packages_required: Vec<String>,
+    pub packages_optional: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -155,12 +158,36 @@ pub struct FilterEditorState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnvEditMode {
     List,
-    Edit { original_key: Option<String> },
+    Edit {
+        original_key: Option<String>,
+        value_mode: EnvValueMode,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnvValueMode {
+    String,
+    NixExpression,
+}
+
+impl EnvValueMode {
+    pub fn toggle(self) -> Self {
+        match self {
+            EnvValueMode::String => EnvValueMode::NixExpression,
+            EnvValueMode::NixExpression => EnvValueMode::String,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct EnvEntry {
+    pub key: String,
+    pub value: String,
 }
 
 #[derive(Debug, Clone)]
 pub struct EnvEditorState {
-    pub entries: Vec<(String, String)>,
+    pub entries: Vec<EnvEntry>,
     pub cursor: usize,
     pub input: String,
     pub input_cursor: usize,
@@ -188,6 +215,23 @@ pub struct DiffViewerState {
 pub struct PackageInfoState {
     pub lines: Vec<String>,
     pub scroll: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct VersionPickerEntry {
+    pub source: String,
+    pub version: String,
+    pub commit: String,
+    pub commit_date: String,
+    pub branch: String,
+    pub url: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct VersionPickerState {
+    pub entries: Vec<VersionPickerEntry>,
+    pub cursor: usize,
+    pub package: String,
 }
 
 #[derive(Debug, Clone)]
@@ -279,6 +323,7 @@ pub struct Toast {
 pub enum Overlay {
     Help,
     PackageInfo(PackageInfoState),
+    VersionPicker(VersionPickerState),
     PinEditor(PinEditorState),
     Columns(ColumnsEditorState),
     Env(EnvEditorState),
@@ -302,6 +347,10 @@ pub struct App {
     pub presets_collapsed: bool,
     pub changes_collapsed: bool,
     pub columns: ColumnSettings,
+    pub show_details: bool,
+    pub pinned: BTreeMap<String, PinnedPackage>,
+    pub base_pinned: BTreeMap<String, PinnedPackage>,
+    pub pin_map: BTreeMap<String, Pin>,
     pub added: BTreeSet<String>,
     pub removed: BTreeSet<String>,
     pub active_presets: BTreeSet<String>,
@@ -314,6 +363,7 @@ pub struct App {
     pub base_env: BTreeMap<String, String>,
     pub base_shell_hook: Option<String>,
     pub filters: PackageFilters,
+    pub search_mode: SearchMode,
     pub packages_state: TableState,
     pub presets_state: ListState,
     pub overlay: Option<Overlay>,
@@ -339,6 +389,10 @@ impl App {
             presets_collapsed: true,
             changes_collapsed: false,
             columns: ColumnSettings::default(),
+            show_details: true,
+            pinned: BTreeMap::new(),
+            base_pinned: BTreeMap::new(),
+            pin_map: BTreeMap::new(),
             added: BTreeSet::new(),
             removed: BTreeSet::new(),
             active_presets: BTreeSet::new(),
@@ -351,6 +405,7 @@ impl App {
             base_env: BTreeMap::new(),
             base_shell_hook: None,
             filters: PackageFilters::default(),
+            search_mode: SearchMode::All,
             packages_state: TableState::new(),
             presets_state: ListState::default(),
             overlay: None,
@@ -374,12 +429,61 @@ impl App {
         for pkg in &self.removed {
             packages.remove(pkg);
         }
+        for pkg in self.pinned.keys() {
+            packages.insert(pkg.clone());
+        }
         packages.len()
     }
 
+    pub fn cycle_search_mode(&mut self) {
+        self.search_mode = match self.search_mode {
+            SearchMode::All => SearchMode::Name,
+            SearchMode::Name => SearchMode::Description,
+            SearchMode::Description => SearchMode::Binary,
+            SearchMode::Binary => SearchMode::All,
+        };
+    }
+
+    pub fn search_mode_label(&self) -> &'static str {
+        match self.search_mode {
+            SearchMode::All => "all",
+            SearchMode::Name => "name",
+            SearchMode::Description => "desc",
+            SearchMode::Binary => "bin",
+        }
+    }
+
     pub fn is_installed(&self, name: &str) -> bool {
-        let installed = self.preset_packages.contains(name) || self.added.contains(name);
-        installed && !self.removed.contains(name)
+        let base = self.base_attr_for(name);
+        let installed = self.preset_packages.contains(&base)
+            || self.added.contains(&base)
+            || self.pinned.contains_key(&base);
+        installed && !self.removed.contains(&base)
+    }
+
+    pub fn base_attr_for(&self, attr_path: &str) -> String {
+        for prefix in self.pin_map.keys() {
+            let needle = format!("{}.", prefix);
+            if attr_path.starts_with(&needle) {
+                return attr_path[needle.len()..].to_string();
+            }
+        }
+        attr_path.to_string()
+    }
+
+    pub fn pin_for_attr(&self, attr_path: &str) -> Option<(String, Pin)> {
+        for (prefix, pin) in &self.pin_map {
+            let needle = format!("{}.", prefix);
+            if attr_path.starts_with(&needle) {
+                let base = attr_path[needle.len()..].to_string();
+                return Some((base, pin.clone()));
+            }
+        }
+        None
+    }
+
+    pub fn current_package(&self) -> Option<&PackageEntry> {
+        self.packages.get(self.cursor)
     }
 
     pub fn toggle_column(&mut self, column: ColumnKind) {
@@ -479,18 +583,41 @@ impl App {
 
     fn toggle_current_package(&mut self) {
         if let Some(entry) = self.packages.get(self.cursor) {
-            let name = entry.name.clone();
-            if self.preset_packages.contains(&name) {
-                if self.removed.contains(&name) {
-                    self.removed.remove(&name);
-                } else {
-                    self.removed.insert(name.clone());
-                    self.added.remove(&name);
+            if let Some((base, pin)) = self.pin_for_attr(&entry.attr_path) {
+                if self.pinned.remove(&base).is_none() {
+                    let version = entry
+                        .version
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_string());
+                    self.pinned
+                        .insert(base.clone(), PinnedPackage { version, pin });
+                    self.added.remove(&base);
+                    self.removed.remove(&base);
                 }
-            } else if self.added.contains(&name) {
-                self.added.remove(&name);
+                self.update_dirty();
+                return;
+            }
+
+            let base = self.base_attr_for(&entry.attr_path);
+            if self.pinned.remove(&base).is_some() {
+                if self.preset_packages.contains(&base) {
+                    self.removed.insert(base.clone());
+                }
+                self.update_dirty();
+                return;
+            }
+
+            if self.preset_packages.contains(&base) {
+                if self.removed.contains(&base) {
+                    self.removed.remove(&base);
+                } else {
+                    self.removed.insert(base.clone());
+                    self.added.remove(&base);
+                }
+            } else if self.added.contains(&base) {
+                self.added.remove(&base);
             } else {
-                self.added.insert(name);
+                self.added.insert(base);
             }
             self.update_dirty();
         }
@@ -516,6 +643,7 @@ impl App {
         self.base_presets = self.active_presets.clone();
         self.base_env = self.env.clone();
         self.base_shell_hook = self.shell_hook.clone();
+        self.base_pinned = self.pinned.clone();
         self.dirty = false;
     }
 
@@ -524,7 +652,8 @@ impl App {
             || self.removed != self.base_removed
             || self.active_presets != self.base_presets
             || self.env != self.base_env
-            || self.shell_hook != self.base_shell_hook;
+            || self.shell_hook != self.base_shell_hook
+            || self.pinned != self.base_pinned;
     }
 
     pub fn push_toast(&mut self, level: ToastLevel, message: impl Into<String>) {

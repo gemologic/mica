@@ -1,4 +1,4 @@
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use mica_core::config::Config;
@@ -10,12 +10,16 @@ use mica_core::preset::{
     load_embedded_presets, load_presets_from_dir, merge_presets, merge_profile_presets, Preset,
 };
 use mica_core::state::{
-    GlobalProfileState, MicaMetadata, NixBlocks, Pin, PinnedPackage, PresetState, ProjectState,
-    ShellState,
+    GenerationEntry, GlobalProfileState, MicaMetadata, NixBlocks, Pin, PinnedPackage, PresetState,
+    ProjectState, ShellState, NIX_EXPR_PREFIX,
 };
 use mica_index::generate::{
     get_meta, ingest_packages, init_db, list_packages, load_packages_from_json, open_db,
-    search_packages, set_meta,
+    search_packages_with_mode, set_meta, SearchMode as IndexSearchMode,
+};
+use mica_index::versions::{
+    init_versions_db, latest_version_for_source, list_versions, open_versions_db, record_versions,
+    version_for_commit, VersionSource,
 };
 use reqwest::blocking::Client;
 use serde::Deserialize;
@@ -39,8 +43,39 @@ mod tui;
 struct Cli {
     #[arg(short = 'g', long = "global", help = "Operate on global profile")]
     global: bool,
+    #[arg(
+        short = 'f',
+        long = "file",
+        value_name = "PATH",
+        conflicts_with = "dir",
+        help = "Target specific nix file"
+    )]
+    file: Option<PathBuf>,
+    #[arg(
+        short = 'd',
+        long = "dir",
+        value_name = "PATH",
+        conflicts_with = "file",
+        help = "Target directory (uses default.nix)"
+    )]
+    dir: Option<PathBuf>,
+    #[arg(
+        short = 'n',
+        long = "dry-run",
+        help = "Show changes without writing files"
+    )]
+    dry_run: bool,
+    #[arg(
+        short = 'v',
+        long = "verbose",
+        help = "Increase verbosity",
+        conflicts_with = "quiet"
+    )]
+    verbose: bool,
+    #[arg(short = 'q', long = "quiet", help = "Suppress non-error output")]
+    quiet: bool,
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -57,12 +92,22 @@ enum Command {
     },
     #[command(about = "List current state")]
     List,
+    #[command(about = "List available presets")]
+    Presets,
     #[command(about = "Add packages to environment")]
     Add { packages: Vec<String> },
     #[command(about = "Remove packages from environment")]
     Remove { packages: Vec<String> },
     #[command(about = "Search packages (index required)")]
-    Search { query: String },
+    Search {
+        query: String,
+        #[arg(
+            long,
+            value_enum,
+            help = "Search mode (name, description, binary, all)"
+        )]
+        mode: Option<SearchModeArg>,
+    },
     #[command(about = "Manage environment variables")]
     Env {
         #[command(subcommand)]
@@ -77,9 +122,9 @@ enum Command {
     Apply { presets: Vec<String> },
     #[command(about = "Remove presets")]
     Unapply { presets: Vec<String> },
-    #[command(about = "Update nixpkgs pin (stub)")]
+    #[command(about = "Update nixpkgs pin")]
     Update {
-        #[arg(help = "Optional package name for version pinning (stub)")]
+        #[arg(help = "Optional package name for version pinning")]
         package: Option<String>,
         #[arg(long, help = "Set nixpkgs URL for the pin")]
         url: Option<String>,
@@ -104,7 +149,14 @@ enum Command {
         #[command(subcommand)]
         command: PinCommand,
     },
-    #[command(about = "Manage package index (stub)")]
+    #[command(about = "Manage global generations")]
+    Generations {
+        #[command(subcommand)]
+        command: GenerationsCommand,
+    },
+    #[command(about = "Output standalone nix file to stdout")]
+    Export,
+    #[command(about = "Manage package index")]
     Index {
         #[command(subcommand)]
         command: IndexCommand,
@@ -114,8 +166,29 @@ enum Command {
         #[arg(long, help = "Update state from existing nix file (limited parsing)")]
         from_nix: bool,
     },
+    #[command(about = "Validate current configuration")]
+    Eval,
     #[command(about = "Check for drift between state and nix file")]
     Diff,
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum SearchModeArg {
+    Name,
+    Description,
+    Binary,
+    All,
+}
+
+impl SearchModeArg {
+    fn to_search_mode(self) -> mica_core::config::SearchMode {
+        match self {
+            SearchModeArg::Name => mica_core::config::SearchMode::Name,
+            SearchModeArg::Description => mica_core::config::SearchMode::Description,
+            SearchModeArg::Binary => mica_core::config::SearchMode::Binary,
+            SearchModeArg::All => mica_core::config::SearchMode::All,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -163,8 +236,16 @@ enum PinCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum GenerationsCommand {
+    #[command(about = "List generations")]
+    List,
+    #[command(about = "Rollback to a generation (defaults to previous)")]
+    Rollback { id: Option<u64> },
+}
+
+#[derive(Debug, Subcommand)]
 enum IndexCommand {
-    #[command(about = "Show index status (stub)")]
+    #[command(about = "Show index status")]
     Status,
     #[command(about = "Rebuild local index from nix-env json")]
     Rebuild {
@@ -173,7 +254,7 @@ enum IndexCommand {
         #[arg(long, help = "Output path for the index db")]
         output: Option<PathBuf>,
     },
-    #[command(about = "Fetch remote index (stub)")]
+    #[command(about = "Fetch remote index")]
     Fetch,
 }
 
@@ -185,6 +266,8 @@ enum CliError {
     MissingState(PathBuf),
     #[error("state file already exists at {0}")]
     StateExists(PathBuf),
+    #[error("--file/--dir are not supported with --global")]
+    InvalidGlobalTarget,
     #[error("pin is incomplete in state file, update pin before syncing")]
     IncompletePin,
     #[error("missing home directory in environment")]
@@ -211,6 +294,14 @@ enum CliError {
     MissingIndex(PathBuf),
     #[error("missing remote index url in config")]
     MissingRemoteIndex,
+    #[error("remote index fetch failed ({0}): {1}")]
+    RemoteIndexFailed(reqwest::StatusCode, String),
+    #[error("generation history is empty")]
+    NoGenerations,
+    #[error("generation {0} not found")]
+    GenerationNotFound(u64),
+    #[error("generation snapshot missing at {0}")]
+    GenerationSnapshotMissing(PathBuf),
     #[error("invalid pin name: {0}")]
     InvalidPinName(String),
     #[error("pin already exists: {0}")]
@@ -223,6 +314,10 @@ enum CliError {
     GitHubApiStatus(reqwest::StatusCode, String),
     #[error("github api response missing sha")]
     GitHubApiMissingSha,
+    #[error("github api response missing default branch")]
+    GitHubApiMissingDefaultBranch,
+    #[error("github api response missing commit date")]
+    GitHubApiMissingDate,
     #[error("http error: {0}")]
     Http(#[from] reqwest::Error),
     #[error("nix-prefetch-url not found in PATH, install Nix or pass --sha256")]
@@ -233,6 +328,16 @@ enum CliError {
     NixPrefetchFailed(String),
     #[error("nix-prefetch-url did not return a nix sha256 hash")]
     NixPrefetchMissingHash,
+    #[error("nix-instantiate not found in PATH, install Nix to run eval")]
+    MissingNixInstantiate,
+    #[error("nix-instantiate failed: {0}")]
+    NixInstantiateFailed(String),
+    #[error("nix-build not found in PATH, install Nix to run eval")]
+    MissingNixBuild,
+    #[error("nix-build failed: {0}")]
+    NixBuildFailed(String),
+    #[error("failed to create temp nix file: {0}")]
+    TempNixFile(std::io::Error),
     #[error("nix-env not found in PATH, install Nix to auto-build the index")]
     MissingNixEnv,
     #[error("failed to run nix-env: {0}")]
@@ -244,6 +349,106 @@ enum CliError {
 #[derive(Debug, Deserialize)]
 struct GitHubCommit {
     sha: String,
+    #[serde(default)]
+    commit: GitHubCommitInfo,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct GitHubCommitInfo {
+    #[serde(default)]
+    author: Option<GitHubCommitAuthor>,
+    #[serde(default)]
+    committer: Option<GitHubCommitAuthor>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubCommitAuthor {
+    date: String,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct GitHubRepoInfo {
+    #[serde(default)]
+    default_branch: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Output {
+    quiet: bool,
+    verbose: bool,
+}
+
+impl Output {
+    fn info(&self, message: impl AsRef<str>) {
+        if !self.quiet {
+            println!("{}", message.as_ref());
+        }
+    }
+
+    fn status(&self, message: impl AsRef<str>) {
+        if !self.quiet {
+            eprintln!("{}", message.as_ref());
+        }
+    }
+
+    fn warn(&self, message: impl AsRef<str>) {
+        if !self.quiet {
+            eprintln!("{}", message.as_ref());
+        }
+    }
+
+    fn verbose(&self, message: impl AsRef<str>) {
+        if self.verbose && !self.quiet {
+            eprintln!("{}", message.as_ref());
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ProjectPaths {
+    nix_path: PathBuf,
+    root_dir: PathBuf,
+}
+
+impl ProjectPaths {
+    fn new(file: Option<PathBuf>, dir: Option<PathBuf>) -> Result<Self, CliError> {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        match (file, dir) {
+            (Some(file), None) => {
+                let nix_path = if file.is_absolute() {
+                    file
+                } else {
+                    cwd.join(file)
+                };
+                let parent = nix_path
+                    .parent()
+                    .filter(|path| !path.as_os_str().is_empty())
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| cwd.clone());
+                let root_dir = std::fs::canonicalize(&parent).unwrap_or(parent);
+                Ok(ProjectPaths { nix_path, root_dir })
+            }
+            (None, Some(dir)) => {
+                let root = if dir.is_absolute() {
+                    dir
+                } else {
+                    cwd.join(dir)
+                };
+                let root_dir = std::fs::canonicalize(&root).unwrap_or(root);
+                let nix_path = root_dir.join("default.nix");
+                Ok(ProjectPaths { nix_path, root_dir })
+            }
+            (None, None) => {
+                let root_dir = std::fs::canonicalize(&cwd).unwrap_or(cwd);
+                let nix_path = root_dir.join("default.nix");
+                Ok(ProjectPaths { nix_path, root_dir })
+            }
+            _ => Ok(ProjectPaths {
+                nix_path: cwd.join("default.nix"),
+                root_dir: cwd,
+            }),
+        }
+    }
 }
 
 fn main() {
@@ -255,16 +460,60 @@ fn main() {
 
 fn run() -> Result<(), CliError> {
     let cli = Cli::parse();
+    let command = cli.command.unwrap_or(Command::Tui);
+    let output = Output {
+        quiet: cli.quiet,
+        verbose: cli.verbose,
+    };
+    if cli.global && (cli.file.is_some() || cli.dir.is_some()) {
+        return Err(CliError::InvalidGlobalTarget);
+    }
+    let project_paths = if cli.global {
+        None
+    } else {
+        Some(ProjectPaths::new(cli.file.clone(), cli.dir.clone())?)
+    };
 
-    match cli.command {
-        Command::Tui => run_tui(cli.global),
+    match command {
+        Command::Tui => {
+            if cli.dry_run {
+                output.info("dry-run ignored for TUI");
+            }
+            run_tui(cli.global, project_paths.as_ref(), &output)
+        }
         Command::Init { repo } => {
             if cli.global {
-                init_profile_state(repo)?;
-                let state = load_profile_state()?;
-                sync_and_install_profile(&state)?;
+                if cli.dry_run {
+                    let state = build_initial_profile_state(repo)?;
+                    output.info(format!(
+                        "dry-run: would initialize {}",
+                        profile_state_path()?.display()
+                    ));
+                    if output.verbose {
+                        output.info(build_profile_nix(&state)?);
+                    }
+                } else {
+                    init_profile_state(repo)?;
+                    let state = load_profile_state()?;
+                    sync_and_install_profile(&output, &state)?;
+                }
             } else {
-                init_project_state(repo)?;
+                let paths = project_paths.as_ref().expect("project paths missing");
+                if cli.dry_run {
+                    if paths.nix_path.exists() {
+                        return Err(CliError::StateExists(paths.nix_path.to_path_buf()));
+                    }
+                    let state = build_initial_project_state(repo)?;
+                    output.info(format!(
+                        "dry-run: would initialize {}",
+                        paths.nix_path.display()
+                    ));
+                    if output.verbose {
+                        output.info(build_project_nix(paths, &state)?);
+                    }
+                } else {
+                    init_project_state(paths, repo)?;
+                }
             }
             Ok(())
         }
@@ -278,10 +527,10 @@ fn run() -> Result<(), CliError> {
                     state.packages.removed.retain(|item| item != &pkg);
                 }
                 update_profile_modified(&mut state);
-                save_profile_state(&state)?;
-                sync_and_install_profile(&state)?;
+                apply_profile_changes(&output, cli.dry_run, &state)?;
             } else {
-                let mut state = load_project_state()?;
+                let paths = project_paths.as_ref().expect("project paths missing");
+                let mut state = load_project_state(paths)?;
                 for pkg in packages {
                     if !state.packages.added.contains(&pkg) {
                         state.packages.added.push(pkg.clone());
@@ -289,7 +538,7 @@ fn run() -> Result<(), CliError> {
                     state.packages.removed.retain(|item| item != &pkg);
                 }
                 update_project_modified(&mut state);
-                sync_project_nix(&state)?;
+                apply_project_changes(&output, paths, cli.dry_run, &state)?;
             }
             Ok(())
         }
@@ -303,10 +552,10 @@ fn run() -> Result<(), CliError> {
                     state.packages.added.retain(|item| item != &pkg);
                 }
                 update_profile_modified(&mut state);
-                save_profile_state(&state)?;
-                sync_and_install_profile(&state)?;
+                apply_profile_changes(&output, cli.dry_run, &state)?;
             } else {
-                let mut state = load_project_state()?;
+                let paths = project_paths.as_ref().expect("project paths missing");
+                let mut state = load_project_state(paths)?;
                 for pkg in packages {
                     if !state.packages.removed.contains(&pkg) {
                         state.packages.removed.push(pkg.clone());
@@ -314,34 +563,40 @@ fn run() -> Result<(), CliError> {
                     state.packages.added.retain(|item| item != &pkg);
                 }
                 update_project_modified(&mut state);
-                sync_project_nix(&state)?;
+                apply_project_changes(&output, paths, cli.dry_run, &state)?;
             }
             Ok(())
         }
-        Command::Search { query } => {
+        Command::Search { query, mode } => {
             let index_path = index_db_path()?;
             if !index_path.exists() {
                 return Err(CliError::MissingIndex(index_path));
             }
             let conn = open_db(&index_path)?;
-            let results = search_packages(&conn, &query, 25)?;
+            let config = load_config_or_default()?;
+            let search_mode = mode
+                .map(|mode| mode.to_search_mode())
+                .unwrap_or(config.tui.search_mode);
+            let results =
+                search_packages_with_mode(&conn, &query, 25, to_index_search_mode(&search_mode))?;
             for pkg in results {
                 let version = pkg.version.unwrap_or_else(|| "-".to_string());
                 let description = pkg.description.unwrap_or_default();
-                println!(
+                output.info(format!(
                     "{} {} {}",
                     normalize_attr_path(&pkg.attr_path),
                     version,
                     description
-                );
+                ));
             }
             Ok(())
         }
         Command::Env { command } => {
             if cli.global {
-                println!("env is only supported in project mode for now");
+                output.info("env is only supported in project mode for now");
             } else {
-                let mut state = load_project_state()?;
+                let paths = project_paths.as_ref().expect("project paths missing");
+                let mut state = load_project_state(paths)?;
                 match command {
                     EnvCommand::Set { key, value } => {
                         state.env.insert(key, value);
@@ -351,15 +606,16 @@ fn run() -> Result<(), CliError> {
                     }
                 }
                 update_project_modified(&mut state);
-                sync_project_nix(&state)?;
+                apply_project_changes(&output, paths, cli.dry_run, &state)?;
             }
             Ok(())
         }
         Command::Shell { command } => {
             if cli.global {
-                println!("shell hook is only supported in project mode for now");
+                output.info("shell hook is only supported in project mode for now");
             } else {
-                let mut state = load_project_state()?;
+                let paths = project_paths.as_ref().expect("project paths missing");
+                let mut state = load_project_state(paths)?;
                 match command {
                     ShellCommand::Set { content } => {
                         state.shell.hook = Some(content);
@@ -369,7 +625,7 @@ fn run() -> Result<(), CliError> {
                     }
                 }
                 update_project_modified(&mut state);
-                sync_project_nix(&state)?;
+                apply_project_changes(&output, paths, cli.dry_run, &state)?;
             }
             Ok(())
         }
@@ -382,17 +638,17 @@ fn run() -> Result<(), CliError> {
                     }
                 }
                 update_profile_modified(&mut state);
-                save_profile_state(&state)?;
-                sync_and_install_profile(&state)?;
+                apply_profile_changes(&output, cli.dry_run, &state)?;
             } else {
-                let mut state = load_project_state()?;
+                let paths = project_paths.as_ref().expect("project paths missing");
+                let mut state = load_project_state(paths)?;
                 for preset in presets {
                     if !state.presets.active.contains(&preset) {
                         state.presets.active.push(preset);
                     }
                 }
                 update_project_modified(&mut state);
-                sync_project_nix(&state)?;
+                apply_project_changes(&output, paths, cli.dry_run, &state)?;
             }
             Ok(())
         }
@@ -404,26 +660,60 @@ fn run() -> Result<(), CliError> {
                     .active
                     .retain(|preset| !presets.contains(preset));
                 update_profile_modified(&mut state);
-                save_profile_state(&state)?;
-                sync_and_install_profile(&state)?;
+                apply_profile_changes(&output, cli.dry_run, &state)?;
             } else {
-                let mut state = load_project_state()?;
+                let paths = project_paths.as_ref().expect("project paths missing");
+                let mut state = load_project_state(paths)?;
                 state
                     .presets
                     .active
                     .retain(|preset| !presets.contains(preset));
                 update_project_modified(&mut state);
-                sync_project_nix(&state)?;
+                apply_project_changes(&output, paths, cli.dry_run, &state)?;
             }
             Ok(())
         }
         Command::List => {
             if cli.global {
                 let state = load_profile_state()?;
-                print_profile_state(&state);
+                print_profile_state(&output, &state);
             } else {
-                let state = load_project_state()?;
-                print_project_state(&state);
+                let paths = project_paths.as_ref().expect("project paths missing");
+                let state = load_project_state(paths)?;
+                print_project_state(&output, &state);
+            }
+            Ok(())
+        }
+        Command::Presets => {
+            let mut presets = load_all_presets()?;
+            presets.sort_by(|left, right| {
+                left.order
+                    .cmp(&right.order)
+                    .then_with(|| left.name.cmp(&right.name))
+            });
+
+            for preset in presets {
+                let description = preset.description.trim();
+                if description.is_empty() {
+                    output.info(format!(
+                        "{} [order:{} req:{} opt:{}] {}",
+                        preset.name,
+                        preset.order,
+                        preset.packages_required.len(),
+                        preset.packages_optional.len(),
+                        preset.source.display()
+                    ));
+                } else {
+                    output.info(format!(
+                        "{} [order:{} req:{} opt:{}] {} - {}",
+                        preset.name,
+                        preset.order,
+                        preset.packages_required.len(),
+                        preset.packages_optional.len(),
+                        preset.source.display(),
+                        description
+                    ));
+                }
             }
             Ok(())
         }
@@ -456,10 +746,10 @@ fn run() -> Result<(), CliError> {
                     resolved_sha256,
                     branch,
                 )?;
-                save_profile_state(&state)?;
-                sync_and_install_profile(&state)?;
+                apply_profile_changes(&output, cli.dry_run, &state)?;
             } else {
-                let mut state = load_project_state()?;
+                let paths = project_paths.as_ref().expect("project paths missing");
+                let mut state = load_project_state(paths)?;
                 let base_pin = match package.as_deref() {
                     Some(name) => state
                         .packages
@@ -479,15 +769,16 @@ fn run() -> Result<(), CliError> {
                     resolved_sha256,
                     branch,
                 )?;
-                save_project_state(&state)?;
+                apply_project_changes(&output, paths, cli.dry_run, &state)?;
             }
             Ok(())
         }
         Command::Pin { command } => {
             if cli.global {
-                println!("pins are only supported in project mode for now");
+                output.info("pins are only supported in project mode for now");
             } else {
-                let mut state = load_project_state()?;
+                let paths = project_paths.as_ref().expect("project paths missing");
+                let mut state = load_project_state(paths)?;
                 match command {
                     PinCommand::Add {
                         name,
@@ -510,25 +801,60 @@ fn run() -> Result<(), CliError> {
                                 latest,
                             },
                         )?;
-                        save_project_state(&state)?;
+                        apply_project_changes(&output, paths, cli.dry_run, &state)?;
                     }
                     PinCommand::Remove { name } => {
                         if state.pins.remove(&name).is_none() {
                             return Err(CliError::PinNotFound(name));
                         }
                         update_project_modified(&mut state);
-                        save_project_state(&state)?;
+                        apply_project_changes(&output, paths, cli.dry_run, &state)?;
                     }
                     PinCommand::List => {
                         if state.pins.is_empty() {
-                            println!("no extra pins configured");
+                            output.info("no extra pins configured");
                         } else {
                             for (name, pin) in &state.pins {
-                                println!("{} -> {} @ {}", name, pin.url, pin.rev);
+                                output.info(format!("{} -> {} @ {}", name, pin.url, pin.rev));
                             }
                         }
                     }
                 }
+            }
+            Ok(())
+        }
+        Command::Generations { command } => {
+            if !cli.global {
+                output.info("generations are only available in global mode");
+                return Ok(());
+            }
+            match command {
+                GenerationsCommand::List => {
+                    let state = load_profile_state()?;
+                    list_generations(&output, &state)?;
+                }
+                GenerationsCommand::Rollback { id } => {
+                    rollback_generation(&output, id, cli.dry_run)?;
+                }
+            }
+            Ok(())
+        }
+        Command::Export => {
+            if cli.global {
+                let state = load_profile_state()?;
+                let generated = build_profile_nix(&state)?;
+                let formatted = format_mica_nix(&generated);
+                io::stdout()
+                    .write_all(formatted.as_bytes())
+                    .map_err(CliError::WriteNix)?;
+            } else {
+                let paths = project_paths.as_ref().expect("project paths missing");
+                let state = load_project_state(paths)?;
+                let generated = build_project_nix(paths, &state)?;
+                let formatted = format_mica_nix(&generated);
+                io::stdout()
+                    .write_all(formatted.as_bytes())
+                    .map_err(CliError::WriteNix)?;
             }
             Ok(())
         }
@@ -542,79 +868,116 @@ fn run() -> Result<(), CliError> {
                     let conn = open_db(&index_path)?;
                     let meta = get_meta(&conn)?;
                     if meta.is_empty() {
-                        println!("index: {}", index_path.display());
-                        println!("meta: empty");
+                        output.info(format!("index: {}", index_path.display()));
+                        output.info("meta: empty");
                     } else {
-                        println!("index: {}", index_path.display());
+                        output.info(format!("index: {}", index_path.display()));
                         for (key, value) in meta {
-                            println!("{}: {}", key, value);
+                            output.info(format!("{}: {}", key, value));
                         }
                     }
                 }
-                IndexCommand::Rebuild { input, output } => {
-                    let output_path = output.unwrap_or(index_db_path()?);
+                IndexCommand::Rebuild {
+                    input,
+                    output: output_path_override,
+                } => {
+                    if cli.dry_run {
+                        output.info("dry-run: skipping index rebuild");
+                        return Ok(());
+                    }
+                    let output_path = output_path_override.unwrap_or(index_db_path()?);
                     let pin = if cli.global {
                         load_profile_state().ok().map(|state| state.pin)
                     } else {
-                        load_project_state().ok().map(|state| state.pin)
+                        project_paths
+                            .as_ref()
+                            .and_then(|paths| load_project_state(paths).ok().map(|state| state.pin))
                     };
-                    let count = rebuild_index_from_json(&input, &output_path, pin.as_ref())?;
-                    println!("indexed {} packages", count);
+                    let count =
+                        rebuild_index_from_json(&output, &input, &output_path, pin.as_ref())?;
+                    output.info(format!("indexed {} packages", count));
                 }
                 IndexCommand::Fetch => {
+                    if cli.dry_run {
+                        output.info("dry-run: skipping index fetch");
+                        return Ok(());
+                    }
                     let config = load_config_or_default()?;
                     if config.index.remote_url.trim().is_empty() {
                         return Err(CliError::MissingRemoteIndex);
                     }
-                    println!(
-                        "index fetch not implemented, remote_url={}",
-                        config.index.remote_url
-                    );
+                    let index_path = index_db_path()?;
+                    fetch_remote_index(&config.index.remote_url, &index_path)?;
+                    output.info(format!("index fetched to {}", index_path.display()));
+                    if let Ok(conn) = open_db(&index_path) {
+                        if let Ok(meta) = get_meta(&conn) {
+                            for (key, value) in meta {
+                                output.info(format!("{}: {}", key, value));
+                            }
+                        }
+                    }
                 }
             }
             Ok(())
         }
         Command::Sync { from_nix } => {
             if cli.global {
+                let mut state = load_profile_state()?;
                 if from_nix {
-                    let mut state = load_profile_state()?;
                     update_profile_state_from_nix(&mut state)?;
-                    save_profile_state(&state)?;
                 }
-                let state = load_profile_state()?;
-                sync_and_install_profile(&state)?;
+                apply_profile_changes(&output, cli.dry_run, &state)?;
             } else {
+                let paths = project_paths.as_ref().expect("project paths missing");
+                let mut state = load_project_state(paths)?;
                 if from_nix {
-                    let mut state = load_project_state()?;
-                    update_project_state_from_nix(&mut state)?;
+                    update_project_state_from_nix(paths, &mut state)?;
                 }
-                let state = load_project_state()?;
-                sync_project_nix(&state)?;
+                apply_project_changes(&output, paths, cli.dry_run, &state)?;
+            }
+            Ok(())
+        }
+        Command::Eval => {
+            if cli.global {
+                let state = load_profile_state()?;
+                let generated = build_profile_nix(&state)?;
+                eval_nix_contents(&output, &generated)?;
+            } else {
+                let paths = project_paths.as_ref().expect("project paths missing");
+                let state = load_project_state(paths)?;
+                let generated = build_project_nix(paths, &state)?;
+                eval_nix_contents(&output, &generated)?;
             }
             Ok(())
         }
         Command::Diff => {
             if cli.global {
                 let state = load_profile_state()?;
-                diff_profile(&state)?;
+                diff_profile(&output, &state)?;
             } else {
-                let state = load_project_state()?;
-                diff_project(&state)?;
+                let paths = project_paths.as_ref().expect("project paths missing");
+                let state = load_project_state(paths)?;
+                diff_project(&output, paths, &state)?;
             }
             Ok(())
         }
     }
 }
 
-fn run_tui(global: bool) -> Result<(), CliError> {
+fn run_tui(
+    global: bool,
+    project_paths: Option<&ProjectPaths>,
+    output: &Output,
+) -> Result<(), CliError> {
     if global {
-        run_tui_global()
+        run_tui_global(output)
     } else {
-        run_tui_project()
+        let paths = project_paths.expect("project paths missing");
+        run_tui_project(paths, output)
     }
 }
 
-fn run_tui_project() -> Result<(), CliError> {
+fn run_tui_project(paths: &ProjectPaths, output: &Output) -> Result<(), CliError> {
     use crossterm::terminal::{
         disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
     };
@@ -622,24 +985,37 @@ fn run_tui_project() -> Result<(), CliError> {
     use ratatui::Terminal;
     use tui::app::App;
 
-    let project_path = project_nix_path();
+    let project_path = &paths.nix_path;
     if !project_path.exists() {
-        eprintln!(
+        output.status(format!(
             "default.nix missing at {}, initializing",
             project_path.display()
-        );
-        init_project_state(None)?;
+        ));
+        init_project_state(paths, None)?;
     }
-    let mut state = load_project_state()?;
+    let mut state = load_project_state(paths)?;
+    let config = load_config_or_default().ok();
     let index_path = index_db_path()?;
     if !index_path.exists() {
-        eprintln!(
-            "index missing at {}, building from nix-env -qaP --json",
-            index_path.display()
-        );
-        let pins = collect_index_pins(&state);
-        let count = rebuild_index_from_pins_with_spinner(&index_path, &pins)?;
-        eprintln!("index ready, {} packages", count);
+        let mut fetched = false;
+        if let Some(config) = &config {
+            fetched = try_fetch_remote_index(output, &config.index.remote_url, &index_path)?;
+            if !config.index.remote_url.trim().is_empty() {
+                record_index_check_time(output);
+            }
+        }
+        if !fetched {
+            output.status(format!(
+                "index missing at {}, building from nix-env -qaP --json",
+                index_path.display()
+            ));
+            let pins = collect_index_pins(&state);
+            let count = rebuild_index_from_pins_with_spinner(output, &index_path, &pins)?;
+            output.status(format!("index ready, {} packages", count));
+        }
+    }
+    if let Some(config) = &config {
+        let _ = maybe_refresh_remote_index(output, config, &index_path)?;
     }
 
     let mut conn = open_db(&index_path)?;
@@ -649,21 +1025,38 @@ fn run_tui_project() -> Result<(), CliError> {
         has_meta = false;
     }
     if !has_meta {
-        eprintln!("index missing metadata, rebuilding from nix-env -qaP --json --meta");
-        let pins = collect_index_pins(&state);
-        let count = rebuild_index_from_pins_with_spinner(&index_path, &pins)?;
-        eprintln!("index ready, {} packages", count);
-        conn = open_db(&index_path)?;
-        meta = get_meta(&conn).unwrap_or_default();
+        let mut fetched = false;
+        if let Some(config) = &config {
+            fetched = try_fetch_remote_index(output, &config.index.remote_url, &index_path)?;
+            if !config.index.remote_url.trim().is_empty() {
+                record_index_check_time(output);
+            }
+        }
+        if fetched {
+            conn = open_db(&index_path)?;
+            meta = get_meta(&conn).unwrap_or_default();
+            has_meta = meta_has_key(&meta, "index_meta");
+            if has_meta && !index_has_descriptions(&conn)? {
+                has_meta = false;
+            }
+        }
+        if !has_meta {
+            output.status("index missing metadata, rebuilding from nix-env -qaP --json --meta");
+            let pins = collect_index_pins(&state);
+            let count = rebuild_index_from_pins_with_spinner(output, &index_path, &pins)?;
+            output.status(format!("index ready, {} packages", count));
+            conn = open_db(&index_path)?;
+            meta = get_meta(&conn).unwrap_or_default();
+        }
     }
     let presets = load_tui_presets()?;
     let mut app = App::new(Vec::new(), presets);
     app.mode = tui::app::AppMode::Project;
-    if let Ok(dir) = std::env::current_dir() {
-        app.project_dir = Some(dir.to_string_lossy().to_string());
-    }
-    if let Ok(config) = load_config_or_default() {
-        apply_columns_from_config(&mut app, &config);
+    app.project_dir = Some(paths.root_dir.to_string_lossy().to_string());
+    if let Some(config) = &config {
+        apply_columns_from_config(&mut app, config);
+        apply_search_mode_from_config(&mut app, config);
+        apply_show_details_from_config(&mut app, config);
     }
     app.index_info = index_info_from_meta(meta);
     apply_state_to_app(&mut app, &state);
@@ -676,7 +1069,15 @@ fn run_tui_project() -> Result<(), CliError> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).map_err(CliError::WriteNix)?;
 
-    let result = run_tui_loop_project(&mut terminal, &mut app, &mut state, &index_path, &mut conn);
+    let result = run_tui_loop_project(
+        &mut terminal,
+        &mut app,
+        &mut state,
+        paths,
+        &index_path,
+        &mut conn,
+        output,
+    );
 
     disable_raw_mode().map_err(CliError::WriteNix)?;
     crossterm::execute!(terminal.backend_mut(), LeaveAlternateScreen)
@@ -685,7 +1086,7 @@ fn run_tui_project() -> Result<(), CliError> {
     result
 }
 
-fn run_tui_global() -> Result<(), CliError> {
+fn run_tui_global(output: &Output) -> Result<(), CliError> {
     use crossterm::terminal::{
         disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
     };
@@ -695,13 +1096,13 @@ fn run_tui_global() -> Result<(), CliError> {
 
     let profile_state = profile_state_path()?;
     if !profile_state.exists() {
-        eprintln!(
+        output.status(format!(
             "global profile missing at {}, initializing",
             profile_state.display()
-        );
+        ));
         init_profile_state(None)?;
         let state = load_profile_state()?;
-        sync_and_install_profile(&state)?;
+        sync_and_install_profile(output, &state)?;
     }
     let mut state = load_profile_state()?;
     let profile_nix = profile_nix_path()?;
@@ -709,15 +1110,28 @@ fn run_tui_global() -> Result<(), CliError> {
         sync_profile_nix(&state)?;
     }
 
+    let config = load_config_or_default().ok();
     let index_path = index_db_path()?;
     if !index_path.exists() {
-        eprintln!(
-            "index missing at {}, building from nix-env -qaP --json",
-            index_path.display()
-        );
-        let pins = collect_index_pins_profile(&state);
-        let count = rebuild_index_from_pins_with_spinner(&index_path, &pins)?;
-        eprintln!("index ready, {} packages", count);
+        let mut fetched = false;
+        if let Some(config) = &config {
+            fetched = try_fetch_remote_index(output, &config.index.remote_url, &index_path)?;
+            if !config.index.remote_url.trim().is_empty() {
+                record_index_check_time(output);
+            }
+        }
+        if !fetched {
+            output.status(format!(
+                "index missing at {}, building from nix-env -qaP --json",
+                index_path.display()
+            ));
+            let pins = collect_index_pins_profile(&state);
+            let count = rebuild_index_from_pins_with_spinner(output, &index_path, &pins)?;
+            output.status(format!("index ready, {} packages", count));
+        }
+    }
+    if let Some(config) = &config {
+        let _ = maybe_refresh_remote_index(output, config, &index_path)?;
     }
 
     let mut conn = open_db(&index_path)?;
@@ -727,19 +1141,38 @@ fn run_tui_global() -> Result<(), CliError> {
         has_meta = false;
     }
     if !has_meta {
-        eprintln!("index missing metadata, rebuilding from nix-env -qaP --json --meta");
-        let pins = collect_index_pins_profile(&state);
-        let count = rebuild_index_from_pins_with_spinner(&index_path, &pins)?;
-        eprintln!("index ready, {} packages", count);
-        conn = open_db(&index_path)?;
-        meta = get_meta(&conn).unwrap_or_default();
+        let mut fetched = false;
+        if let Some(config) = &config {
+            fetched = try_fetch_remote_index(output, &config.index.remote_url, &index_path)?;
+            if !config.index.remote_url.trim().is_empty() {
+                record_index_check_time(output);
+            }
+        }
+        if fetched {
+            conn = open_db(&index_path)?;
+            meta = get_meta(&conn).unwrap_or_default();
+            has_meta = meta_has_key(&meta, "index_meta");
+            if has_meta && !index_has_descriptions(&conn)? {
+                has_meta = false;
+            }
+        }
+        if !has_meta {
+            output.status("index missing metadata, rebuilding from nix-env -qaP --json --meta");
+            let pins = collect_index_pins_profile(&state);
+            let count = rebuild_index_from_pins_with_spinner(output, &index_path, &pins)?;
+            output.status(format!("index ready, {} packages", count));
+            conn = open_db(&index_path)?;
+            meta = get_meta(&conn).unwrap_or_default();
+        }
     }
 
     let presets = load_tui_presets()?;
     let mut app = App::new(Vec::new(), presets);
     app.mode = tui::app::AppMode::Global;
-    if let Ok(config) = load_config_or_default() {
-        apply_columns_from_config(&mut app, &config);
+    if let Some(config) = &config {
+        apply_columns_from_config(&mut app, config);
+        apply_search_mode_from_config(&mut app, config);
+        apply_show_details_from_config(&mut app, config);
     }
     app.index_info = index_info_from_meta(meta);
     apply_profile_state_to_app(&mut app, &state);
@@ -752,7 +1185,14 @@ fn run_tui_global() -> Result<(), CliError> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).map_err(CliError::WriteNix)?;
 
-    let result = run_tui_loop_global(&mut terminal, &mut app, &mut state, &index_path, &mut conn);
+    let result = run_tui_loop_global(
+        &mut terminal,
+        &mut app,
+        &mut state,
+        &index_path,
+        &mut conn,
+        output,
+    );
 
     disable_raw_mode().map_err(CliError::WriteNix)?;
     crossterm::execute!(terminal.backend_mut(), LeaveAlternateScreen)
@@ -765,8 +1205,10 @@ fn run_tui_loop_project(
     terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
     app: &mut tui::app::App,
     state: &mut ProjectState,
+    paths: &ProjectPaths,
     index_path: &Path,
     conn: &mut rusqlite::Connection,
+    output: &Output,
 ) -> Result<(), CliError> {
     use crossterm::event::{self, Event};
 
@@ -779,13 +1221,15 @@ fn run_tui_loop_project(
         if event::poll(Duration::from_millis(200)).map_err(CliError::WriteNix)? {
             if let Event::Key(key) = event::read().map_err(CliError::WriteNix)? {
                 if app.overlay.is_some() {
-                    if let Err(err) =
-                        handle_overlay_key(key, terminal, app, state, index_path, conn)
-                    {
+                    if let Err(err) = handle_overlay_key(
+                        key, terminal, app, state, paths, index_path, conn, output,
+                    ) {
                         app.push_toast(tui::app::ToastLevel::Error, err.to_string());
                     }
                 } else {
-                    if let Err(err) = handle_main_key(key, terminal, app, state, index_path, conn) {
+                    if let Err(err) =
+                        handle_main_key(key, terminal, app, state, paths, index_path, conn, output)
+                    {
                         app.push_toast(tui::app::ToastLevel::Error, err.to_string());
                     }
                 }
@@ -806,6 +1250,7 @@ fn run_tui_loop_global(
     state: &mut GlobalProfileState,
     index_path: &Path,
     conn: &mut rusqlite::Connection,
+    output: &Output,
 ) -> Result<(), CliError> {
     use crossterm::event::{self, Event};
 
@@ -818,11 +1263,11 @@ fn run_tui_loop_global(
         if event::poll(Duration::from_millis(200)).map_err(CliError::WriteNix)? {
             if let Event::Key(key) = event::read().map_err(CliError::WriteNix)? {
                 if app.overlay.is_some() {
-                    if let Err(err) = handle_overlay_key_global(key, app, conn) {
+                    if let Err(err) = handle_overlay_key_global(key, terminal, app, conn, output) {
                         app.push_toast(tui::app::ToastLevel::Error, err.to_string());
                     }
                 } else if let Err(err) =
-                    handle_main_key_global(key, terminal, app, state, index_path, conn)
+                    handle_main_key_global(key, terminal, app, state, index_path, conn, output)
                 {
                     app.push_toast(tui::app::ToastLevel::Error, err.to_string());
                 }
@@ -837,13 +1282,16 @@ fn run_tui_loop_global(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_main_key(
     key: KeyEvent,
     terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
     app: &mut tui::app::App,
     state: &mut ProjectState,
+    paths: &ProjectPaths,
     index_path: &Path,
     conn: &mut rusqlite::Connection,
+    output: &Output,
 ) -> Result<(), CliError> {
     use tui::app::{FilterKind, Focus, Overlay};
     use tui::input::{map_key, InputAction};
@@ -856,7 +1304,7 @@ fn handle_main_key(
         InputAction::Next => app.next(),
         InputAction::Prev => app.prev(),
         InputAction::Save => {
-            save_tui_selection(state, app)?;
+            save_tui_selection(paths, state, app)?;
             app.push_toast(tui::app::ToastLevel::Info, "Saved changes");
         }
         InputAction::OpenEnv => open_env_overlay(app),
@@ -873,10 +1321,34 @@ fn handle_main_key(
             app.filters.show_installed_only = !app.filters.show_installed_only;
             update_search_results(conn, app)?;
         }
+        InputAction::ToggleSearchMode => {
+            app.cycle_search_mode();
+            if let Err(err) = save_search_mode_to_config(&app.search_mode) {
+                app.push_toast(tui::app::ToastLevel::Error, err.to_string());
+            }
+            update_search_results(conn, app)?;
+            app.push_toast(
+                tui::app::ToastLevel::Info,
+                format!("Search mode: {}", app.search_mode_label()),
+            );
+        }
+        InputAction::ToggleDetails => {
+            app.show_details = !app.show_details;
+            if let Err(err) = save_show_details_to_config(app.show_details) {
+                app.push_toast(tui::app::ToastLevel::Error, err.to_string());
+            }
+            app.push_toast(
+                tui::app::ToastLevel::Info,
+                format!(
+                    "Details panel: {}",
+                    if app.show_details { "on" } else { "off" }
+                ),
+            );
+        }
         InputAction::EditLicenseFilter => open_filter_overlay(app, FilterKind::License),
         InputAction::EditPlatformFilter => open_filter_overlay(app, FilterKind::Platform),
         InputAction::PreviewDiff => {
-            app.overlay = Some(build_diff_overlay(state, app)?);
+            app.overlay = Some(build_diff_overlay(paths, state, app)?);
         }
         InputAction::ShowPackageInfo => {
             if app.focus != Focus::Packages {
@@ -887,21 +1359,38 @@ fn handle_main_key(
                 app.push_toast(tui::app::ToastLevel::Info, "No package selected");
             }
         }
+        InputAction::OpenVersionPicker => {
+            if app.focus != Focus::Packages {
+                app.push_toast(
+                    tui::app::ToastLevel::Info,
+                    "Focus packages to view versions",
+                );
+            } else {
+                match build_version_picker_overlay(app) {
+                    Ok(Some(overlay)) => app.overlay = Some(overlay),
+                    Ok(None) => app.push_toast(
+                        tui::app::ToastLevel::Info,
+                        "No version history for selection",
+                    ),
+                    Err(err) => app.push_toast(tui::app::ToastLevel::Error, err.to_string()),
+                }
+            }
+        }
         InputAction::UpdatePin => {
             with_tui_suspended(terminal, || {
-                let rev = run_with_spinner("fetching latest nixpkgs revision", || {
+                let rev = run_with_spinner(output, "fetching latest nixpkgs revision", || {
                     fetch_latest_github_rev(&state.pin.url, &state.pin.branch)
                 })?;
-                let sha256 = run_with_spinner("prefetching nixpkgs tarball", || {
+                let sha256 = run_with_spinner(output, "prefetching nixpkgs tarball", || {
                     fetch_nix_sha256(&state.pin.url, &rev)
                 })?;
                 state.pin.rev = rev;
                 state.pin.sha256 = sha256;
                 state.pin.updated = Utc::now().date_naive();
                 update_project_modified(state);
-                save_project_state(state)?;
+                save_project_state(paths, state)?;
                 let pins = collect_index_pins(state);
-                rebuild_index_from_pins_with_spinner(index_path, &pins)?;
+                rebuild_index_from_pins_with_spinner(output, index_path, &pins)?;
                 Ok(())
             })?;
             *conn = open_db(index_path)?;
@@ -932,7 +1421,7 @@ fn handle_main_key(
         InputAction::RebuildIndex => {
             with_tui_suspended(terminal, || {
                 let pins = collect_index_pins(state);
-                rebuild_index_from_pins_with_spinner(index_path, &pins)?;
+                rebuild_index_from_pins_with_spinner(output, index_path, &pins)?;
                 Ok(())
             })?;
             *conn = open_db(index_path)?;
@@ -941,7 +1430,7 @@ fn handle_main_key(
             app.push_toast(tui::app::ToastLevel::Info, "Index rebuilt");
         }
         InputAction::Sync => {
-            update_project_state_from_nix(state)?;
+            update_project_state_from_nix(paths, state)?;
             apply_state_to_app(app, state);
             update_search_results(conn, app)?;
             app.refresh_preset_filter();
@@ -993,6 +1482,7 @@ fn handle_main_key_global(
     state: &mut GlobalProfileState,
     index_path: &Path,
     conn: &mut rusqlite::Connection,
+    output: &Output,
 ) -> Result<(), CliError> {
     use tui::app::{FilterKind, Focus, Overlay};
     use tui::input::{map_key, InputAction};
@@ -1005,7 +1495,7 @@ fn handle_main_key_global(
         InputAction::Next => app.next(),
         InputAction::Prev => app.prev(),
         InputAction::Save => {
-            with_tui_suspended(terminal, || save_profile_tui_selection(state, app))?;
+            with_tui_suspended(terminal, || save_profile_tui_selection(output, state, app))?;
             app.push_toast(tui::app::ToastLevel::Info, "Saved and installed");
         }
         InputAction::OpenEnv => {
@@ -1026,6 +1516,30 @@ fn handle_main_key_global(
             app.filters.show_installed_only = !app.filters.show_installed_only;
             update_search_results(conn, app)?;
         }
+        InputAction::ToggleSearchMode => {
+            app.cycle_search_mode();
+            if let Err(err) = save_search_mode_to_config(&app.search_mode) {
+                app.push_toast(tui::app::ToastLevel::Error, err.to_string());
+            }
+            update_search_results(conn, app)?;
+            app.push_toast(
+                tui::app::ToastLevel::Info,
+                format!("Search mode: {}", app.search_mode_label()),
+            );
+        }
+        InputAction::ToggleDetails => {
+            app.show_details = !app.show_details;
+            if let Err(err) = save_show_details_to_config(app.show_details) {
+                app.push_toast(tui::app::ToastLevel::Error, err.to_string());
+            }
+            app.push_toast(
+                tui::app::ToastLevel::Info,
+                format!(
+                    "Details panel: {}",
+                    if app.show_details { "on" } else { "off" }
+                ),
+            );
+        }
         InputAction::EditLicenseFilter => open_filter_overlay(app, FilterKind::License),
         InputAction::EditPlatformFilter => open_filter_overlay(app, FilterKind::Platform),
         InputAction::PreviewDiff => {
@@ -1043,12 +1557,29 @@ fn handle_main_key_global(
                 }
             }
         }
+        InputAction::OpenVersionPicker => {
+            if app.focus != Focus::Packages {
+                app.push_toast(
+                    tui::app::ToastLevel::Info,
+                    "Focus packages to view versions",
+                );
+            } else {
+                match build_version_picker_overlay(app) {
+                    Ok(Some(overlay)) => app.overlay = Some(overlay),
+                    Ok(None) => app.push_toast(
+                        tui::app::ToastLevel::Info,
+                        "No version history for selection",
+                    ),
+                    Err(err) => app.push_toast(tui::app::ToastLevel::Error, err.to_string()),
+                }
+            }
+        }
         InputAction::UpdatePin => {
             with_tui_suspended(terminal, || {
-                let rev = run_with_spinner("fetching latest nixpkgs revision", || {
+                let rev = run_with_spinner(output, "fetching latest nixpkgs revision", || {
                     fetch_latest_github_rev(&state.pin.url, &state.pin.branch)
                 })?;
-                let sha256 = run_with_spinner("prefetching nixpkgs tarball", || {
+                let sha256 = run_with_spinner(output, "prefetching nixpkgs tarball", || {
                     fetch_nix_sha256(&state.pin.url, &rev)
                 })?;
                 state.pin.rev = rev;
@@ -1056,9 +1587,9 @@ fn handle_main_key_global(
                 state.pin.updated = Utc::now().date_naive();
                 update_profile_modified(state);
                 save_profile_state(state)?;
-                sync_and_install_profile(state)?;
+                sync_and_install_profile(output, state)?;
                 let pins = collect_index_pins_profile(state);
-                rebuild_index_from_pins_with_spinner(index_path, &pins)?;
+                rebuild_index_from_pins_with_spinner(output, index_path, &pins)?;
                 Ok(())
             })?;
             *conn = open_db(index_path)?;
@@ -1086,7 +1617,7 @@ fn handle_main_key_global(
         InputAction::RebuildIndex => {
             with_tui_suspended(terminal, || {
                 let pins = collect_index_pins_profile(state);
-                rebuild_index_from_pins_with_spinner(index_path, &pins)?;
+                rebuild_index_from_pins_with_spinner(output, index_path, &pins)?;
                 Ok(())
             })?;
             *conn = open_db(index_path)?;
@@ -1140,15 +1671,18 @@ fn handle_main_key_global(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_overlay_key(
     key: KeyEvent,
     terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
     app: &mut tui::app::App,
     state: &mut ProjectState,
+    paths: &ProjectPaths,
     index_path: &Path,
     conn: &mut rusqlite::Connection,
+    output: &Output,
 ) -> Result<(), CliError> {
-    use tui::app::{EnvEditMode, Overlay};
+    use tui::app::{EnvEditMode, EnvValueMode, Overlay};
 
     let overlay = match app.overlay.take() {
         Some(overlay) => overlay,
@@ -1183,6 +1717,34 @@ fn handle_overlay_key(
                 app.overlay = Some(Overlay::PackageInfo(state));
             }
         }
+        Overlay::VersionPicker(mut state) => {
+            let mut close = false;
+            let max = state.entries.len().saturating_sub(1);
+            match key.code {
+                KeyCode::Esc => close = true,
+                KeyCode::Up => {
+                    if state.cursor > 0 {
+                        state.cursor -= 1;
+                    }
+                }
+                KeyCode::Down => {
+                    state.cursor = (state.cursor + 1).min(max);
+                }
+                KeyCode::Enter => {
+                    if let Some(entry) = state.entries.get(state.cursor).cloned() {
+                        let package = state.package.clone();
+                        with_tui_suspended(terminal, || {
+                            apply_version_selection(output, app, &package, entry)
+                        })?;
+                        close = true;
+                    }
+                }
+                _ => {}
+            }
+            if !close {
+                app.overlay = Some(Overlay::VersionPicker(state));
+            }
+        }
         Overlay::PinEditor(mut editor) => {
             let mut close = false;
             match key.code {
@@ -1200,7 +1762,16 @@ fn handle_overlay_key(
                     editor.error = None;
                 }
                 KeyCode::Enter => {
-                    if submit_pin_editor(terminal, app, &mut editor, state, index_path, conn) {
+                    if submit_pin_editor(
+                        terminal,
+                        app,
+                        &mut editor,
+                        state,
+                        paths,
+                        index_path,
+                        conn,
+                        output,
+                    ) {
                         close = true;
                     } else {
                         app.overlay = Some(Overlay::PinEditor(editor));
@@ -1332,8 +1903,8 @@ fn handle_overlay_key(
         },
         Overlay::Env(mut state) => {
             let mut close = false;
-            match state.mode {
-                EnvEditMode::List => match key.code {
+            if matches!(state.mode, EnvEditMode::List) {
+                match key.code {
                     KeyCode::Esc | KeyCode::Char('q') => close = true,
                     KeyCode::Up => {
                         if state.cursor > 0 {
@@ -1346,17 +1917,22 @@ fn handle_overlay_key(
                         }
                     }
                     KeyCode::Char('a') => {
-                        state.mode = EnvEditMode::Edit { original_key: None };
+                        state.mode = EnvEditMode::Edit {
+                            original_key: None,
+                            value_mode: EnvValueMode::String,
+                        };
                         state.input.clear();
                         state.input_cursor = 0;
                         state.error = None;
                     }
                     KeyCode::Enter => {
-                        if let Some((key, value)) = state.entries.get(state.cursor) {
-                            state.input = format!("{}={}", key, value);
+                        if let Some(entry) = state.entries.get(state.cursor) {
+                            state.input =
+                                format!("{}={}", entry.key, env_value_for_editor(&entry.value));
                             state.input_cursor = state.input.len();
                             state.mode = EnvEditMode::Edit {
-                                original_key: Some(key.clone()),
+                                original_key: Some(entry.key.clone()),
+                                value_mode: env_value_mode_from_stored(&entry.value),
                             };
                             state.error = None;
                         }
@@ -1370,8 +1946,9 @@ fn handle_overlay_key(
                         }
                     }
                     _ => {}
-                },
-                EnvEditMode::Edit { .. } => match key.code {
+                }
+            } else {
+                match key.code {
                     KeyCode::Esc => {
                         state.mode = EnvEditMode::List;
                         state.input.clear();
@@ -1382,6 +1959,12 @@ fn handle_overlay_key(
                         Ok(()) => {}
                         Err(err) => state.error = Some(err),
                     },
+                    KeyCode::Tab => {
+                        if let EnvEditMode::Edit { value_mode, .. } = &mut state.mode {
+                            *value_mode = value_mode.toggle();
+                            state.error = None;
+                        }
+                    }
                     KeyCode::Backspace => {
                         if state.input_cursor > 0 {
                             state.input_cursor -= 1;
@@ -1408,7 +1991,7 @@ fn handle_overlay_key(
                         state.input_cursor += 1;
                     }
                     _ => {}
-                },
+                }
             }
 
             if close {
@@ -1542,8 +2125,10 @@ fn handle_overlay_key(
 
 fn handle_overlay_key_global(
     key: KeyEvent,
+    terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
     app: &mut tui::app::App,
     conn: &rusqlite::Connection,
+    output: &Output,
 ) -> Result<(), CliError> {
     use tui::app::Overlay;
 
@@ -1579,6 +2164,34 @@ fn handle_overlay_key_global(
             }
             if !close {
                 app.overlay = Some(Overlay::PackageInfo(state));
+            }
+        }
+        Overlay::VersionPicker(mut state) => {
+            let mut close = false;
+            let max = state.entries.len().saturating_sub(1);
+            match key.code {
+                KeyCode::Esc => close = true,
+                KeyCode::Up => {
+                    if state.cursor > 0 {
+                        state.cursor -= 1;
+                    }
+                }
+                KeyCode::Down => {
+                    state.cursor = (state.cursor + 1).min(max);
+                }
+                KeyCode::Enter => {
+                    if let Some(entry) = state.entries.get(state.cursor).cloned() {
+                        let package = state.package.clone();
+                        with_tui_suspended(terminal, || {
+                            apply_version_selection(output, app, &package, entry)
+                        })?;
+                        close = true;
+                    }
+                }
+                _ => {}
+            }
+            if !close {
+                app.overlay = Some(Overlay::VersionPicker(state));
             }
         }
         Overlay::Columns(mut state) => {
@@ -1741,13 +2354,16 @@ fn pin_editor_prev_field(editor: &mut tui::app::PinEditorState) {
     editor.active = tui::app::PIN_FIELDS[prev];
 }
 
+#[allow(clippy::too_many_arguments)]
 fn submit_pin_editor(
     terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
     app: &mut tui::app::App,
     editor: &mut tui::app::PinEditorState,
     state: &mut ProjectState,
+    paths: &ProjectPaths,
     index_path: &Path,
     conn: &mut rusqlite::Connection,
+    output: &Output,
 ) -> bool {
     editor.error = None;
 
@@ -1816,9 +2432,9 @@ fn submit_pin_editor(
                 latest: use_latest,
             },
         )?;
-        save_project_state(state)?;
+        save_project_state(paths, state)?;
         let pins = collect_index_pins(state);
-        rebuild_index_from_pins_with_spinner(index_path, &pins)?;
+        rebuild_index_from_pins_with_spinner(output, index_path, &pins)?;
         Ok(())
     }) {
         editor.error = Some(err.to_string());
@@ -1874,7 +2490,12 @@ fn update_search_results(
     let packages = if query.is_empty() {
         list_packages(conn, limit + 1)?
     } else {
-        search_packages(conn, query, limit + 1)?
+        search_packages_with_mode(
+            conn,
+            query,
+            limit + 1,
+            to_index_search_mode(&app.search_mode),
+        )?
     };
 
     let total_fetched = packages.len();
@@ -1921,8 +2542,10 @@ fn apply_state_to_app(app: &mut tui::app::App, state: &ProjectState) {
     app.added = state.packages.added.iter().cloned().collect();
     app.removed = state.packages.removed.iter().cloned().collect();
     app.active_presets = state.presets.active.iter().cloned().collect();
+    app.pinned = state.packages.pinned.clone();
     app.env = state.env.clone();
     app.shell_hook = state.shell.hook.clone();
+    apply_pin_map_to_app(app, &collect_index_pins(state));
     app.rebuild_preset_packages();
     app.commit_baseline();
 }
@@ -1931,8 +2554,10 @@ fn apply_profile_state_to_app(app: &mut tui::app::App, state: &GlobalProfileStat
     app.added = state.packages.added.iter().cloned().collect();
     app.removed = state.packages.removed.iter().cloned().collect();
     app.active_presets = state.presets.active.iter().cloned().collect();
+    app.pinned = state.packages.pinned.clone();
     app.env.clear();
     app.shell_hook = None;
+    apply_pin_map_to_app(app, &collect_index_pins_profile(state));
     app.rebuild_preset_packages();
     app.commit_baseline();
 }
@@ -1945,6 +2570,14 @@ fn apply_columns_from_config(app: &mut tui::app::App, config: &Config) {
         show_platforms: config.tui.columns.platforms,
         show_main_program: config.tui.columns.main_program,
     };
+}
+
+fn apply_search_mode_from_config(app: &mut tui::app::App, config: &Config) {
+    app.search_mode = config.tui.search_mode.clone();
+}
+
+fn apply_show_details_from_config(app: &mut tui::app::App, config: &Config) {
+    app.show_details = config.tui.show_details;
 }
 
 fn save_columns_to_config(columns: &tui::app::ColumnSettings) -> Result<(), CliError> {
@@ -1962,6 +2595,33 @@ fn save_columns_to_config(columns: &tui::app::ColumnSettings) -> Result<(), CliE
         .map_err(CliError::Config)
 }
 
+fn save_search_mode_to_config(mode: &mica_core::config::SearchMode) -> Result<(), CliError> {
+    ensure_config_dir()?;
+    let mut config = load_config_or_default()?;
+    config.tui.search_mode = mode.clone();
+    config
+        .save_to_path(&config_path()?)
+        .map_err(CliError::Config)
+}
+
+fn save_show_details_to_config(show_details: bool) -> Result<(), CliError> {
+    ensure_config_dir()?;
+    let mut config = load_config_or_default()?;
+    config.tui.show_details = show_details;
+    config
+        .save_to_path(&config_path()?)
+        .map_err(CliError::Config)
+}
+
+fn to_index_search_mode(mode: &mica_core::config::SearchMode) -> IndexSearchMode {
+    match mode {
+        mica_core::config::SearchMode::Name => IndexSearchMode::Name,
+        mica_core::config::SearchMode::Description => IndexSearchMode::Description,
+        mica_core::config::SearchMode::Binary => IndexSearchMode::Binary,
+        mica_core::config::SearchMode::All => IndexSearchMode::All,
+    }
+}
+
 fn toggle_column_setting(app: &mut tui::app::App, column: tui::app::ColumnKind) {
     app.toggle_column(column);
     if let Err(err) = save_columns_to_config(&app.columns) {
@@ -1970,12 +2630,15 @@ fn toggle_column_setting(app: &mut tui::app::App, column: tui::app::ColumnKind) 
 }
 
 fn open_env_overlay(app: &mut tui::app::App) {
-    let mut entries: Vec<(String, String)> = app
+    let mut entries: Vec<tui::app::EnvEntry> = app
         .env
         .iter()
-        .map(|(key, value)| (key.clone(), value.clone()))
+        .map(|(key, value)| tui::app::EnvEntry {
+            key: key.clone(),
+            value: value.clone(),
+        })
         .collect();
-    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    entries.sort_by(|a, b| a.key.cmp(&b.key));
     app.overlay = Some(tui::app::Overlay::Env(tui::app::EnvEditorState {
         entries,
         cursor: 0,
@@ -2020,18 +2683,20 @@ fn open_filter_overlay(app: &mut tui::app::App, kind: tui::app::FilterKind) {
 }
 
 fn build_diff_overlay(
+    paths: &ProjectPaths,
     state: &ProjectState,
     app: &tui::app::App,
 ) -> Result<tui::app::Overlay, CliError> {
     let mut temp_state = state.clone();
     temp_state.packages.added = app.added.iter().cloned().collect();
     temp_state.packages.removed = app.removed.iter().cloned().collect();
+    temp_state.packages.pinned = app.pinned.clone();
     temp_state.presets.active = app.active_presets.iter().cloned().collect();
     temp_state.env = app.env.clone();
     temp_state.shell.hook = app.shell_hook.clone();
 
-    let generated = format_mica_nix(&build_project_nix(&temp_state)?);
-    let existing = std::fs::read_to_string(project_nix_path()).map_err(CliError::ReadNix)?;
+    let generated = format_mica_nix(&build_project_nix(paths, &temp_state)?);
+    let existing = std::fs::read_to_string(&paths.nix_path).map_err(CliError::ReadNix)?;
     let full_diff = diff_lines(&existing, &generated);
     let mut changes_only = diff_lines_changes_only(&existing, &generated);
     if changes_only.is_empty() {
@@ -2053,6 +2718,7 @@ fn build_diff_overlay_profile(
     let mut temp_state = state.clone();
     temp_state.packages.added = app.added.iter().cloned().collect();
     temp_state.packages.removed = app.removed.iter().cloned().collect();
+    temp_state.packages.pinned = app.pinned.clone();
     temp_state.presets.active = app.active_presets.iter().cloned().collect();
 
     let presets = load_all_presets()?;
@@ -2172,6 +2838,95 @@ fn build_package_info_overlay_with_pins(
     }))
 }
 
+fn build_version_picker_overlay(
+    app: &tui::app::App,
+) -> Result<Option<tui::app::Overlay>, CliError> {
+    let pkg = match app.packages.get(app.cursor) {
+        Some(pkg) => pkg,
+        None => return Ok(None),
+    };
+    let base_attr = app.base_attr_for(&pkg.attr_path);
+    let versions_path = versions_db_path()?;
+    if !versions_path.exists() {
+        return Ok(None);
+    }
+    let conn = open_versions_db(&versions_path).map_err(CliError::Index)?;
+    let versions = list_versions(&conn, &base_attr, 200).map_err(CliError::Index)?;
+    if versions.is_empty() {
+        return Ok(None);
+    }
+    let entries = versions
+        .into_iter()
+        .map(|entry| tui::app::VersionPickerEntry {
+            source: entry.source,
+            version: entry.version,
+            commit: entry.commit,
+            commit_date: entry.commit_date,
+            branch: entry.branch,
+            url: entry.url,
+        })
+        .collect();
+
+    Ok(Some(tui::app::Overlay::VersionPicker(
+        tui::app::VersionPickerState {
+            entries,
+            cursor: 0,
+            package: base_attr,
+        },
+    )))
+}
+
+fn apply_version_selection(
+    output: &Output,
+    app: &mut tui::app::App,
+    package: &str,
+    entry: tui::app::VersionPickerEntry,
+) -> Result<(), CliError> {
+    let sha256 = run_with_spinner(output, "prefetching nix tarball", || {
+        fetch_nix_sha256(&entry.url, &entry.commit)
+    })?;
+    let pin = Pin {
+        name: None,
+        url: entry.url,
+        rev: entry.commit,
+        sha256,
+        branch: entry.branch,
+        updated: Utc::now().date_naive(),
+    };
+    app.pinned.insert(
+        package.to_string(),
+        PinnedPackage {
+            version: entry.version,
+            pin,
+        },
+    );
+    app.added.remove(package);
+    app.removed.remove(package);
+    app.update_dirty();
+    app.push_toast(tui::app::ToastLevel::Info, "Pinned package version");
+    Ok(())
+}
+
+fn resolve_pinned_version(package: &str, pin: &Pin) -> Result<Option<String>, CliError> {
+    let versions_path = versions_db_path()?;
+    if !versions_path.exists() {
+        return Ok(None);
+    }
+    let conn = open_versions_db(&versions_path).map_err(CliError::Index)?;
+    let source = pin_source_label(pin);
+    if let Some(entry) =
+        version_for_commit(&conn, package, &source, &pin.rev).map_err(CliError::Index)?
+    {
+        return Ok(Some(entry.version));
+    }
+    if let Some(entry) =
+        latest_version_for_source(&conn, package, &source).map_err(CliError::Index)?
+    {
+        return Ok(Some(entry.version));
+    }
+    Ok(None)
+}
+
 fn apply_env_input(state: &mut tui::app::EnvEditorState) -> Result<(), String> {
     let input = state.input.trim();
     if input.is_empty() {
@@ -2184,39 +2939,49 @@ fn apply_env_input(state: &mut tui::app::EnvEditorState) -> Result<(), String> {
     if key.is_empty() {
         return Err("key cannot be empty".to_string());
     }
-    let value = raw_value.trim().to_string();
+    let raw_value = raw_value.trim();
 
-    let original = match &state.mode {
-        tui::app::EnvEditMode::Edit { original_key } => original_key.clone(),
-        _ => None,
+    let (original, value_mode) = match &state.mode {
+        tui::app::EnvEditMode::Edit {
+            original_key,
+            value_mode,
+        } => (original_key.clone(), *value_mode),
+        _ => (None, tui::app::EnvValueMode::String),
     };
+    let value = encode_env_editor_value(raw_value, value_mode)?;
 
     if let Some(original_key) = &original {
-        if original_key != key && state.entries.iter().any(|(entry_key, _)| entry_key == key) {
+        if original_key != key && state.entries.iter().any(|entry| entry.key == key) {
             return Err("key already exists".to_string());
         }
         if let Some(entry) = state
             .entries
             .iter_mut()
-            .find(|(entry_key, _)| entry_key == original_key)
+            .find(|entry| &entry.key == original_key)
         {
-            entry.0 = key.to_string();
-            entry.1 = value;
+            entry.key = key.to_string();
+            entry.value = value;
         } else {
-            state.entries.push((key.to_string(), value));
+            state.entries.push(tui::app::EnvEntry {
+                key: key.to_string(),
+                value,
+            });
         }
     } else {
-        if state.entries.iter().any(|(entry_key, _)| entry_key == key) {
+        if state.entries.iter().any(|entry| entry.key == key) {
             return Err("key already exists".to_string());
         }
-        state.entries.push((key.to_string(), value));
+        state.entries.push(tui::app::EnvEntry {
+            key: key.to_string(),
+            value,
+        });
     }
 
-    state.entries.sort_by(|a, b| a.0.cmp(&b.0));
+    state.entries.sort_by(|a, b| a.key.cmp(&b.key));
     state.cursor = state
         .entries
         .iter()
-        .position(|(entry_key, _)| entry_key == key)
+        .position(|entry| entry.key == key)
         .unwrap_or(0);
     state.mode = tui::app::EnvEditMode::List;
     state.input.clear();
@@ -2227,13 +2992,63 @@ fn apply_env_input(state: &mut tui::app::EnvEditorState) -> Result<(), String> {
 
 fn apply_env_overlay(app: &mut tui::app::App, state: tui::app::EnvEditorState) {
     let mut env = BTreeMap::new();
-    for (key, value) in state.entries {
+    for entry in state.entries {
+        let key = entry.key;
+        let value = entry.value;
         if !key.trim().is_empty() {
             env.insert(key, value);
         }
     }
     app.env = env;
     app.update_dirty();
+}
+
+fn env_value_mode_from_stored(value: &str) -> tui::app::EnvValueMode {
+    if value.starts_with(NIX_EXPR_PREFIX) || is_legacy_nix_expression_value(value) {
+        tui::app::EnvValueMode::NixExpression
+    } else {
+        tui::app::EnvValueMode::String
+    }
+}
+
+fn env_value_for_editor(value: &str) -> String {
+    value
+        .strip_prefix(NIX_EXPR_PREFIX)
+        .unwrap_or(value)
+        .to_string()
+}
+
+fn encode_env_editor_value(raw: &str, mode: tui::app::EnvValueMode) -> Result<String, String> {
+    match mode {
+        tui::app::EnvValueMode::String => Ok(raw.to_string()),
+        tui::app::EnvValueMode::NixExpression => {
+            if raw.trim().is_empty() {
+                return Err("expression cannot be empty".to_string());
+            }
+            Ok(format!("{}{}", NIX_EXPR_PREFIX, raw.trim()))
+        }
+    }
+}
+
+fn is_legacy_nix_expression_value(value: &str) -> bool {
+    let trimmed = value.trim();
+    (trimmed.len() >= 2
+        && trimmed.starts_with('\"')
+        && trimmed.ends_with('\"')
+        && contains_unescaped_nix_interpolation(trimmed))
+        || (trimmed.len() >= 4 && trimmed.starts_with("''") && trimmed.ends_with("''"))
+}
+
+fn contains_unescaped_nix_interpolation(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let mut idx = 0usize;
+    while idx + 1 < bytes.len() {
+        if bytes[idx] == b'$' && bytes[idx + 1] == b'{' && (idx == 0 || bytes[idx - 1] != b'\\') {
+            return true;
+        }
+        idx += 1;
+    }
+    false
 }
 
 fn apply_shell_overlay(app: &mut tui::app::App, lines: &[String]) {
@@ -2348,50 +3163,54 @@ fn load_tui_presets() -> Result<Vec<tui::app::PresetEntry>, CliError> {
             description: preset.description,
             order: preset.order,
             packages_required: preset.packages_required,
+            packages_optional: preset.packages_optional,
         })
         .collect();
     presets.sort_by_key(|preset| preset.order);
     Ok(presets)
 }
 
-fn save_tui_selection(state: &mut ProjectState, app: &mut tui::app::App) -> Result<(), CliError> {
+fn save_tui_selection(
+    paths: &ProjectPaths,
+    state: &mut ProjectState,
+    app: &mut tui::app::App,
+) -> Result<(), CliError> {
     state.packages.added = app.added.iter().cloned().collect();
     state.packages.removed = app.removed.iter().cloned().collect();
+    state.packages.pinned = app.pinned.clone();
     state.presets.active = app.active_presets.iter().cloned().collect();
     state.env = app.env.clone();
     state.shell.hook = app.shell_hook.clone();
     update_project_modified(state);
-    save_project_state(state)?;
+    save_project_state(paths, state)?;
     app.commit_baseline();
     Ok(())
 }
 
 fn save_profile_tui_selection(
+    output: &Output,
     state: &mut GlobalProfileState,
     app: &mut tui::app::App,
 ) -> Result<(), CliError> {
     state.packages.added = app.added.iter().cloned().collect();
     state.packages.removed = app.removed.iter().cloned().collect();
+    state.packages.pinned = app.pinned.clone();
     state.presets.active = app.active_presets.iter().cloned().collect();
     update_profile_modified(state);
     save_profile_state(state)?;
-    sync_and_install_profile(state)?;
+    sync_and_install_profile(output, state)?;
     app.commit_baseline();
     Ok(())
 }
 
-fn init_project_state(repo: Option<String>) -> Result<(), CliError> {
-    let path = project_nix_path();
-    if path.exists() {
-        return Err(CliError::StateExists(path));
-    }
+fn build_initial_project_state(repo: Option<String>) -> Result<ProjectState, CliError> {
     let config = load_config_or_default()?;
     let now = Utc::now();
     let url = resolve_init_repo(repo, &config);
     let branch = config.nixpkgs.default_branch.clone();
     let rev = fetch_latest_github_rev(&url, &branch)?;
     let sha256 = fetch_nix_sha256(&url, &rev)?;
-    let state = ProjectState {
+    Ok(ProjectState {
         mica: MicaMetadata {
             version: "0.1.0".to_string(),
             created: now,
@@ -2411,12 +3230,20 @@ fn init_project_state(repo: Option<String>) -> Result<(), CliError> {
         env: BTreeMap::new(),
         shell: ShellState::default(),
         nix: NixBlocks::default(),
-    };
-    sync_project_nix(&state)?;
+    })
+}
+
+fn init_project_state(paths: &ProjectPaths, repo: Option<String>) -> Result<(), CliError> {
+    let path = &paths.nix_path;
+    if path.exists() {
+        return Err(CliError::StateExists(path.to_path_buf()));
+    }
+    let state = build_initial_project_state(repo)?;
+    sync_project_nix(paths, &state)?;
     Ok(())
 }
 
-fn init_profile_state(repo: Option<String>) -> Result<(), CliError> {
+fn build_initial_profile_state(repo: Option<String>) -> Result<GlobalProfileState, CliError> {
     let path = profile_state_path()?;
     if path.exists() {
         return Err(CliError::StateExists(path));
@@ -2428,7 +3255,7 @@ fn init_profile_state(repo: Option<String>) -> Result<(), CliError> {
     let branch = config.nixpkgs.default_branch.clone();
     let rev = fetch_latest_github_rev(&url, &branch)?;
     let sha256 = fetch_nix_sha256(&url, &rev)?;
-    let state = GlobalProfileState {
+    Ok(GlobalProfileState {
         mica: MicaMetadata {
             version: "0.1.0".to_string(),
             created: now,
@@ -2445,7 +3272,12 @@ fn init_profile_state(repo: Option<String>) -> Result<(), CliError> {
         presets: PresetState::default(),
         packages: Default::default(),
         generations: Default::default(),
-    };
+    })
+}
+
+fn init_profile_state(repo: Option<String>) -> Result<(), CliError> {
+    let state = build_initial_profile_state(repo)?;
+    let path = profile_state_path()?;
     state.save_to_path(&path).map_err(CliError::State)
 }
 
@@ -2550,6 +3382,15 @@ fn collect_index_pins_profile(state: &GlobalProfileState) -> Vec<IndexPin> {
     }
 
     pins
+}
+
+fn apply_pin_map_to_app(app: &mut tui::app::App, pins: &[IndexPin]) {
+    app.pin_map.clear();
+    for pin in pins {
+        if let Some(label) = pin.name.as_ref() {
+            app.pin_map.insert(label.clone(), pin.pin.clone());
+        }
+    }
 }
 
 fn sanitize_pin_label(value: &str) -> String {
@@ -2747,6 +3588,7 @@ fn unique_pin_label(base: &str, used: &mut BTreeSet<String>) -> String {
 }
 
 fn rebuild_index_from_json(
+    output: &Output,
     input: &Path,
     output_path: &Path,
     pin: Option<&Pin>,
@@ -2754,10 +3596,40 @@ fn rebuild_index_from_json(
     let mut packages = load_packages_from_json(input)?;
     normalize_attr_paths(&mut packages);
     let index_has_meta = packages_have_meta(&packages);
+    if let Some(pin) = pin {
+        let versions_path = versions_db_path()?;
+        if let Some(parent) = versions_path.parent() {
+            std::fs::create_dir_all(parent).map_err(CliError::WriteNix)?;
+        }
+        let mut versions_conn = init_versions_db(&versions_path)?;
+        let indexed_at = Utc::now().to_rfc3339();
+        let source = pin_source_label(pin);
+        let commit_date = pin_commit_date(output, pin);
+        let branch = pin_branch_label(pin);
+        let version_source = VersionSource {
+            source,
+            url: pin.url.clone(),
+            branch,
+            commit: pin.rev.clone(),
+            commit_date,
+            indexed_at: indexed_at.clone(),
+        };
+        record_versions(&mut versions_conn, &version_source, &packages).map_err(CliError::Index)?;
+    }
     rebuild_index_with_packages(output_path, &packages, pin, index_has_meta)
 }
 
-fn rebuild_index_from_pins(output_path: &Path, pins: &[IndexPin]) -> Result<usize, CliError> {
+fn rebuild_index_from_pins(
+    output: &Output,
+    output_path: &Path,
+    pins: &[IndexPin],
+) -> Result<usize, CliError> {
+    let versions_path = versions_db_path()?;
+    if let Some(parent) = versions_path.parent() {
+        std::fs::create_dir_all(parent).map_err(CliError::WriteNix)?;
+    }
+    let mut versions_conn = init_versions_db(&versions_path)?;
+    let indexed_at = Utc::now().to_rfc3339();
     let mut packages = Vec::new();
     for (idx, index_pin) in pins.iter().enumerate() {
         if idx == 0 {
@@ -2765,8 +3637,32 @@ fn rebuild_index_from_pins(output_path: &Path, pins: &[IndexPin]) -> Result<usiz
         } else if ensure_pin_complete(&index_pin.pin).is_err() {
             continue;
         }
-        let mut pin_packages = load_packages_from_pin(&index_pin.pin)?;
+        let pin_label = index_pin.name.as_deref().unwrap_or("nixpkgs");
+        let mut pin_packages = match load_packages_from_pin(output, &index_pin.pin) {
+            Ok(packages) => packages,
+            Err(err) if idx > 0 => {
+                output.warn(format!(
+                    "warning: skipping supplemental pin '{}' ({}@{}): {}",
+                    pin_label, index_pin.pin.url, index_pin.pin.rev, err
+                ));
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
         normalize_attr_paths(&mut pin_packages);
+        let source = pin_source_label(&index_pin.pin);
+        let commit_date = pin_commit_date(output, &index_pin.pin);
+        let branch = pin_branch_label(&index_pin.pin);
+        let version_source = VersionSource {
+            source,
+            url: index_pin.pin.url.clone(),
+            branch,
+            commit: index_pin.pin.rev.clone(),
+            commit_date,
+            indexed_at: indexed_at.clone(),
+        };
+        record_versions(&mut versions_conn, &version_source, &pin_packages)
+            .map_err(CliError::Index)?;
         if let Some(prefix) = &index_pin.name {
             for pkg in &mut pin_packages {
                 pkg.attr_path = format!("{}.{}", prefix, pkg.attr_path);
@@ -2784,15 +3680,138 @@ fn rebuild_index_from_pins(output_path: &Path, pins: &[IndexPin]) -> Result<usiz
 }
 
 fn rebuild_index_from_pins_with_spinner(
+    output: &Output,
     output_path: &Path,
     pins: &[IndexPin],
 ) -> Result<usize, CliError> {
-    run_with_spinner("building index", || {
-        rebuild_index_from_pins(output_path, pins)
+    run_with_spinner(output, "building index", || {
+        rebuild_index_from_pins(output, output_path, pins)
     })
 }
 
-fn load_packages_from_pin(pin: &Pin) -> Result<Vec<mica_index::generate::NixPackage>, CliError> {
+fn resolve_remote_index_url(remote_url: &str) -> Option<String> {
+    let trimmed = remote_url.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.ends_with(".db") {
+        Some(trimmed.to_string())
+    } else {
+        Some(format!("{}/index.db", trimmed.trim_end_matches('/')))
+    }
+}
+
+fn fetch_remote_index(remote_url: &str, output_path: &Path) -> Result<(), CliError> {
+    let url = resolve_remote_index_url(remote_url).ok_or(CliError::MissingRemoteIndex)?;
+    let client = Client::builder().timeout(Duration::from_secs(30)).build()?;
+    let response = client.get(&url).send()?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().unwrap_or_default();
+        return Err(CliError::RemoteIndexFailed(status, body));
+    }
+    let bytes = response.bytes()?;
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent).map_err(CliError::WriteNix)?;
+    }
+    let tmp_path = output_path.with_extension("tmp");
+    std::fs::write(&tmp_path, &bytes).map_err(CliError::WriteNix)?;
+    std::fs::rename(&tmp_path, output_path).map_err(CliError::WriteNix)?;
+    Ok(())
+}
+
+fn try_fetch_remote_index(
+    output: &Output,
+    remote_url: &str,
+    output_path: &Path,
+) -> Result<bool, CliError> {
+    let Some(url) = resolve_remote_index_url(remote_url) else {
+        return Ok(false);
+    };
+    output.status(format!("fetching remote index from {}", url));
+    match fetch_remote_index(remote_url, output_path) {
+        Ok(()) => {
+            output.status("remote index fetched");
+            Ok(true)
+        }
+        Err(err) => {
+            output.warn(format!("remote index fetch failed: {}", err));
+            Ok(false)
+        }
+    }
+}
+
+fn index_check_path() -> Result<PathBuf, CliError> {
+    Ok(cache_dir()?.join("index.last_check"))
+}
+
+fn read_index_check_time() -> Result<Option<DateTime<Utc>>, CliError> {
+    let path = index_check_path()?;
+    let content = match std::fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(CliError::ReadNix(err)),
+    };
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    match DateTime::parse_from_rfc3339(trimmed) {
+        Ok(dt) => Ok(Some(dt.with_timezone(&Utc))),
+        Err(_) => Ok(None),
+    }
+}
+
+fn write_index_check_time(now: DateTime<Utc>) -> Result<(), CliError> {
+    let path = index_check_path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(CliError::WriteNix)?;
+    }
+    std::fs::write(path, now.to_rfc3339()).map_err(CliError::WriteNix)
+}
+
+fn record_index_check_time(output: &Output) {
+    if let Err(err) = write_index_check_time(Utc::now()) {
+        output.verbose(format!("index check timestamp write failed: {}", err));
+    }
+}
+
+fn should_check_remote_index(config: &Config) -> Result<bool, CliError> {
+    if config.index.remote_url.trim().is_empty() {
+        return Ok(false);
+    }
+    if config.index.update_check_interval == 0 {
+        return Ok(false);
+    }
+    let now = Utc::now();
+    if let Some(last) = read_index_check_time()? {
+        let elapsed = now.signed_duration_since(last);
+        let interval = chrono::Duration::hours(config.index.update_check_interval as i64);
+        if elapsed < interval {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn maybe_refresh_remote_index(
+    output: &Output,
+    config: &Config,
+    index_path: &Path,
+) -> Result<bool, CliError> {
+    if !should_check_remote_index(config)? {
+        return Ok(false);
+    }
+    output.status("checking remote index for updates");
+    let fetched = try_fetch_remote_index(output, &config.index.remote_url, index_path)?;
+    record_index_check_time(output);
+    Ok(fetched)
+}
+
+fn load_packages_from_pin(
+    output: &Output,
+    pin: &Pin,
+) -> Result<Vec<mica_index::generate::NixPackage>, CliError> {
     let expr_path = temp_index_nix_path();
     let json_path = temp_index_json_path();
     let mut skip = parse_skip_list(
@@ -2810,17 +3829,17 @@ fn load_packages_from_pin(pin: &Pin) -> Result<Vec<mica_index::generate::NixPack
         } else {
             skip.join(",")
         };
-        eprintln!(
+        output.status(format!(
             "index attempt {}/{} (skipped: {}, show-trace: {})",
             attempts, max_attempts, skipped_label, use_show_trace
-        );
+        ));
         let all_skip = build_index_skip_list(&skip);
         let all_skip_label = if all_skip.is_empty() {
             "none".to_string()
         } else {
             all_skip.join(",")
         };
-        eprintln!("index skip list: {}", all_skip_label);
+        output.verbose(format!("index skip list: {}", all_skip_label));
         std::fs::write(&expr_path, nix_env_expression(pin, &all_skip))
             .map_err(CliError::WriteNix)?;
 
@@ -2848,8 +3867,8 @@ fn load_packages_from_pin(pin: &Pin) -> Result<Vec<mica_index::generate::NixPack
             }
         })?;
 
-        let output = child.wait_with_output().map_err(CliError::NixEnvIo)?;
-        if output.status.success() {
+        let command_output = child.wait_with_output().map_err(CliError::NixEnvIo)?;
+        if command_output.status.success() {
             let packages = load_packages_from_json(&json_path)?;
             if !keep_index_temp_files() {
                 let _ = std::fs::remove_file(&expr_path);
@@ -2858,22 +3877,22 @@ fn load_packages_from_pin(pin: &Pin) -> Result<Vec<mica_index::generate::NixPack
             return Ok(packages);
         }
 
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = String::from_utf8_lossy(&command_output.stderr);
         if attempts < max_attempts {
             if let Some(attr) = parse_failed_attr(&stderr) {
                 if !skip.iter().any(|entry| entry == &attr) {
                     skip.push(attr.clone());
-                    eprintln!("index retry: skipping attr '{}'", attr);
+                    output.status(format!("index retry: skipping attr '{}'", attr));
                     continue;
                 }
             } else if !use_show_trace {
                 use_show_trace = true;
-                eprintln!("index retry: enabling --show-trace");
+                output.status("index retry: enabling --show-trace");
                 continue;
             }
         }
 
-        let mut message = format!("status={}, stderr={}", output.status, stderr.trim());
+        let mut message = format!("status={}, stderr={}", command_output.status, stderr.trim());
         if keep_index_temp_files() {
             message.push_str(&format!(
                 ", expr={}, json={}",
@@ -3030,10 +4049,11 @@ in sanitize pkgs
 }
 
 fn run_with_spinner<T>(
+    output: &Output,
     message: &str,
     action: impl FnOnce() -> Result<T, CliError>,
 ) -> Result<T, CliError> {
-    if !io::stderr().is_terminal() {
+    if output.quiet || !io::stderr().is_terminal() {
         return action();
     }
 
@@ -3056,19 +4076,21 @@ fn run_with_spinner<T>(
     done.store(true, Ordering::Relaxed);
     let _ = handle.join();
     match &result {
-        Ok(_) => eprintln!("\r{} done", message),
-        Err(_) => eprintln!("\r{} failed", message),
+        Ok(_) => output.status(format!("\r{} done", message)),
+        Err(err) => {
+            output.status(format!("\r{} failed", message));
+            output.warn(format!("{} error: {}", message, err));
+        }
     }
-    let _ = io::stderr().flush();
     result
 }
 
-fn load_project_state() -> Result<ProjectState, CliError> {
-    let path = project_nix_path();
+fn load_project_state(paths: &ProjectPaths) -> Result<ProjectState, CliError> {
+    let path = &paths.nix_path;
     if !path.exists() {
-        return Err(CliError::MissingDefaultNix(path));
+        return Err(CliError::MissingDefaultNix(path.to_path_buf()));
     }
-    let content = std::fs::read_to_string(&path).map_err(CliError::ReadNix)?;
+    let content = std::fs::read_to_string(path).map_err(CliError::ReadNix)?;
     let parsed = parse_project_state_from_nix(&content).map_err(CliError::NixStateParse)?;
     let now = Utc::now();
     let mut state = ProjectState {
@@ -3091,7 +4113,12 @@ fn load_project_state() -> Result<ProjectState, CliError> {
     };
 
     state.pin.updated = now.date_naive();
-    state.packages.added = compute_added_packages(parsed.packages, &state.presets.active)?;
+    state.packages.pinned = parsed.pinned;
+    state.packages.added = compute_added_packages(
+        parsed.packages,
+        &state.presets.active,
+        &state.packages.pinned,
+    )?;
     Ok(state)
 }
 
@@ -3109,11 +4136,11 @@ fn save_profile_state(state: &GlobalProfileState) -> Result<(), CliError> {
         .map_err(CliError::State)
 }
 
-fn save_project_state(state: &ProjectState) -> Result<(), CliError> {
-    sync_project_nix(state)
+fn save_project_state(paths: &ProjectPaths, state: &ProjectState) -> Result<(), CliError> {
+    sync_project_nix(paths, state)
 }
 
-fn build_project_nix(state: &ProjectState) -> Result<String, CliError> {
+fn build_project_nix(paths: &ProjectPaths, state: &ProjectState) -> Result<String, CliError> {
     ensure_pin_complete(&state.pin)?;
     let presets = load_all_presets()?;
     let mut preset_map = BTreeMap::new();
@@ -3128,10 +4155,10 @@ fn build_project_nix(state: &ProjectState) -> Result<String, CliError> {
         }
     }
     let merged = merge_presets(&active_presets, state);
-    let project_name = project_dir_name();
+    let project_name = project_dir_name(paths);
     let generated = generate_project_nix(state, &merged, &project_name, Utc::now());
-    let output = if project_nix_path().exists() {
-        let existing = std::fs::read_to_string(project_nix_path()).map_err(CliError::ReadNix)?;
+    let output = if paths.nix_path.exists() {
+        let existing = std::fs::read_to_string(&paths.nix_path).map_err(CliError::ReadNix)?;
         if let Ok(parsed_existing) = parse_nix_file(&existing) {
             if let Ok(parsed_generated) = parse_nix_file(&generated) {
                 assemble_project_nix(ProjectNixParts {
@@ -3266,13 +4293,13 @@ fn trim_trailing_blank_lines(lines: &mut Vec<String>) {
     }
 }
 
-fn sync_project_nix(state: &ProjectState) -> Result<(), CliError> {
-    let output = build_project_nix(state)?;
+fn sync_project_nix(paths: &ProjectPaths, state: &ProjectState) -> Result<(), CliError> {
+    let output = build_project_nix(paths, state)?;
     let formatted = format_mica_nix(&output);
-    std::fs::write(project_nix_path(), formatted).map_err(CliError::WriteNix)
+    std::fs::write(&paths.nix_path, formatted).map_err(CliError::WriteNix)
 }
 
-fn sync_profile_nix(state: &GlobalProfileState) -> Result<(), CliError> {
+fn build_profile_nix(state: &GlobalProfileState) -> Result<String, CliError> {
     ensure_pin_complete(&state.pin)?;
     let presets = load_all_presets()?;
     let mut preset_map = BTreeMap::new();
@@ -3287,14 +4314,256 @@ fn sync_profile_nix(state: &GlobalProfileState) -> Result<(), CliError> {
         }
     }
     let merged = merge_profile_presets(&active_presets, state);
-    let generated = generate_profile_nix(state, &merged, Utc::now());
+    Ok(generate_profile_nix(state, &merged, Utc::now()))
+}
+
+fn sync_profile_nix(state: &GlobalProfileState) -> Result<(), CliError> {
+    let generated = build_profile_nix(state)?;
     let formatted = format_mica_nix(&generated);
     std::fs::write(profile_nix_path()?, formatted).map_err(CliError::WriteNix)
 }
 
-fn sync_and_install_profile(state: &GlobalProfileState) -> Result<(), CliError> {
+fn apply_project_changes(
+    output: &Output,
+    paths: &ProjectPaths,
+    dry_run: bool,
+    state: &ProjectState,
+) -> Result<(), CliError> {
+    if dry_run {
+        output.info("dry-run: skipping write");
+        if paths.nix_path.exists() {
+            diff_project(output, paths, state)?;
+        } else {
+            output.info(format!("would write {}", paths.nix_path.display()));
+        }
+        Ok(())
+    } else {
+        save_project_state(paths, state)
+    }
+}
+
+fn apply_profile_changes(
+    output: &Output,
+    dry_run: bool,
+    state: &GlobalProfileState,
+) -> Result<(), CliError> {
+    if dry_run {
+        output.info("dry-run: skipping install");
+        let path = profile_nix_path()?;
+        if path.exists() {
+            diff_profile(output, state)?;
+        } else {
+            output.info(format!("would write {}", path.display()));
+        }
+        Ok(())
+    } else {
+        save_profile_state(state)?;
+        sync_and_install_profile(output, state)?;
+        Ok(())
+    }
+}
+
+fn generations_dir() -> Result<PathBuf, CliError> {
+    Ok(config_dir()?.join("generations"))
+}
+
+fn latest_nix_env_generation() -> Result<Option<u64>, CliError> {
+    let output = ProcessCommand::new("nix-env")
+        .arg("--list-generations")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|err| {
+            if err.kind() == io::ErrorKind::NotFound {
+                CliError::MissingNixEnv
+            } else {
+                CliError::NixEnvIo(err)
+            }
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(CliError::NixEnvFailed(format!(
+            "status={}, stderr={}",
+            output.status,
+            stderr.trim()
+        )));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut last = None;
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some(id) = trimmed.split_whitespace().next() {
+            if let Ok(parsed) = id.parse::<u64>() {
+                last = Some(parsed);
+            }
+        }
+    }
+    Ok(last)
+}
+
+fn profile_installed_packages(state: &GlobalProfileState) -> Result<Vec<String>, CliError> {
+    let presets = load_all_presets()?;
+    let mut preset_map = BTreeMap::new();
+    for preset in presets {
+        preset_map.insert(preset.name.clone(), preset);
+    }
+    let mut active_presets = Vec::new();
+    for name in &state.presets.active {
+        match preset_map.get(name) {
+            Some(preset) => active_presets.push(preset.clone()),
+            None => return Err(CliError::MissingPreset(name.clone())),
+        }
+    }
+    let merged = merge_profile_presets(&active_presets, state);
+    let mut packages: BTreeSet<String> = merged.all_packages.into_iter().collect();
+    for pkg in state.packages.pinned.keys() {
+        packages.insert(pkg.clone());
+    }
+    Ok(packages.into_iter().collect())
+}
+
+fn snapshot_generation(state: &GlobalProfileState, id: u64) -> Result<(), CliError> {
+    let dir = generations_dir()?.join(id.to_string());
+    std::fs::create_dir_all(&dir).map_err(CliError::WriteNix)?;
+    let snapshot_path = dir.join("profile.toml");
+    state
+        .save_to_path(&snapshot_path)
+        .map_err(CliError::State)?;
+    let profile_nix = profile_nix_path()?;
+    if profile_nix.exists() {
+        let _ = std::fs::copy(&profile_nix, dir.join("profile.nix"));
+    }
+    Ok(())
+}
+
+fn record_profile_generation(output: &Output, state: &GlobalProfileState) -> Result<(), CliError> {
+    let packages = profile_installed_packages(state)?;
+    let fallback = state
+        .generations
+        .history
+        .last()
+        .map(|entry| entry.id + 1)
+        .unwrap_or(1);
+    let id = match latest_nix_env_generation() {
+        Ok(Some(id)) => id,
+        Ok(None) => fallback,
+        Err(err) => {
+            output.warn(format!(
+                "warning: failed to read nix-env generations: {}",
+                err
+            ));
+            fallback
+        }
+    };
+
+    let mut record_state = state.clone();
+    let timestamp = Utc::now();
+    let entry = GenerationEntry {
+        id,
+        timestamp,
+        packages,
+    };
+    if let Some(existing) = record_state
+        .generations
+        .history
+        .iter_mut()
+        .find(|entry| entry.id == id)
+    {
+        *existing = entry;
+    } else {
+        record_state.generations.history.push(entry);
+    }
+    record_state
+        .generations
+        .history
+        .sort_by_key(|entry| entry.id);
+    if record_state.generations.history.len() > 50 {
+        let keep_from = record_state.generations.history.len() - 50;
+        record_state.generations.history = record_state.generations.history.split_off(keep_from);
+    }
+    record_state.mica.modified = timestamp;
+    save_profile_state(&record_state)?;
+    snapshot_generation(&record_state, id)?;
+    Ok(())
+}
+
+fn list_generations(output: &Output, state: &GlobalProfileState) -> Result<(), CliError> {
+    if state.generations.history.is_empty() {
+        output.info("no generations recorded");
+        return Ok(());
+    }
+    for entry in &state.generations.history {
+        output.info(format!(
+            "{} {} ({} pkgs)",
+            entry.id,
+            entry.timestamp.to_rfc3339(),
+            entry.packages.len()
+        ));
+    }
+    Ok(())
+}
+
+fn rollback_generation(
+    output: &Output,
+    target_id: Option<u64>,
+    dry_run: bool,
+) -> Result<(), CliError> {
+    let current = load_profile_state()?;
+    if current.generations.history.is_empty() {
+        return Err(CliError::NoGenerations);
+    }
+    let target = match target_id {
+        Some(id) => id,
+        None => {
+            if current.generations.history.len() < 2 {
+                return Err(CliError::NoGenerations);
+            }
+            current.generations.history[current.generations.history.len() - 2].id
+        }
+    };
+    if !current
+        .generations
+        .history
+        .iter()
+        .any(|entry| entry.id == target)
+    {
+        return Err(CliError::GenerationNotFound(target));
+    }
+    let snapshot_path = generations_dir()?
+        .join(target.to_string())
+        .join("profile.toml");
+    if !snapshot_path.exists() {
+        return Err(CliError::GenerationSnapshotMissing(snapshot_path));
+    }
+    let snapshot = GlobalProfileState::load_from_path(&snapshot_path).map_err(CliError::State)?;
+    let mut next_state = snapshot;
+    next_state.generations = current.generations.clone();
+    next_state.mica.modified = Utc::now();
+
+    if dry_run {
+        output.info(format!("dry-run: would rollback to generation {}", target));
+        diff_profile(output, &next_state)?;
+        return Ok(());
+    }
+
+    save_profile_state(&next_state)?;
+    sync_and_install_profile(output, &next_state)?;
+    output.info(format!("rolled back to generation {}", target));
+    Ok(())
+}
+
+fn sync_and_install_profile(output: &Output, state: &GlobalProfileState) -> Result<(), CliError> {
     sync_profile_nix(state)?;
-    run_with_spinner("installing global profile", install_profile_nix)
+    run_with_spinner(output, "installing global profile", install_profile_nix)?;
+    if let Err(err) = record_profile_generation(output, state) {
+        output.warn(format!("warning: failed to record generation: {}", err));
+    }
+    Ok(())
 }
 
 fn install_profile_nix() -> Result<(), CliError> {
@@ -3332,7 +4601,98 @@ fn install_profile_nix() -> Result<(), CliError> {
     Ok(())
 }
 
-fn diff_project(state: &ProjectState) -> Result<(), CliError> {
+fn create_temp_nix_file(contents: &str) -> Result<PathBuf, CliError> {
+    let dir = std::env::temp_dir();
+    let pid = std::process::id();
+    for attempt in 0..20u32 {
+        let path = dir.join(format!("mica-eval-{}-{}.nix", pid, attempt));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                file.write_all(contents.as_bytes())
+                    .map_err(CliError::TempNixFile)?;
+                return Ok(path);
+            }
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(CliError::TempNixFile(err)),
+        }
+    }
+    Err(CliError::TempNixFile(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "failed to create temp nix file",
+    )))
+}
+
+fn eval_nix_file(path: &Path) -> Result<(), CliError> {
+    let parse_output = ProcessCommand::new("nix-instantiate")
+        .args(["--parse"])
+        .arg(path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|err| {
+            if err.kind() == io::ErrorKind::NotFound {
+                CliError::MissingNixInstantiate
+            } else {
+                CliError::NixInstantiateFailed(err.to_string())
+            }
+        })?;
+    if !parse_output.status.success() {
+        let stdout = String::from_utf8_lossy(&parse_output.stdout);
+        let stderr = String::from_utf8_lossy(&parse_output.stderr);
+        return Err(CliError::NixInstantiateFailed(format!(
+            "status={}, stdout={}, stderr={}",
+            parse_output.status,
+            stdout.trim(),
+            stderr.trim()
+        )));
+    }
+
+    let build_output = ProcessCommand::new("nix-build")
+        .args(["--dry-run"])
+        .arg(path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|err| {
+            if err.kind() == io::ErrorKind::NotFound {
+                CliError::MissingNixBuild
+            } else {
+                CliError::NixBuildFailed(err.to_string())
+            }
+        })?;
+    if !build_output.status.success() {
+        let stdout = String::from_utf8_lossy(&build_output.stdout);
+        let stderr = String::from_utf8_lossy(&build_output.stderr);
+        return Err(CliError::NixBuildFailed(format!(
+            "status={}, stdout={}, stderr={}",
+            build_output.status,
+            stdout.trim(),
+            stderr.trim()
+        )));
+    }
+
+    Ok(())
+}
+
+fn eval_nix_contents(output: &Output, contents: &str) -> Result<(), CliError> {
+    let path = create_temp_nix_file(contents)?;
+    let result = eval_nix_file(&path);
+    let _ = std::fs::remove_file(&path);
+    if result.is_ok() {
+        output.info("validation ok");
+    }
+    result
+}
+
+fn diff_project(
+    output: &Output,
+    paths: &ProjectPaths,
+    state: &ProjectState,
+) -> Result<(), CliError> {
     ensure_pin_complete(&state.pin)?;
     let presets = load_all_presets()?;
     let mut preset_map = BTreeMap::new();
@@ -3347,9 +4707,9 @@ fn diff_project(state: &ProjectState) -> Result<(), CliError> {
         }
     }
     let merged = merge_presets(&active_presets, state);
-    let project_name = project_dir_name();
+    let project_name = project_dir_name(paths);
     let generated = generate_project_nix(state, &merged, &project_name, Utc::now());
-    let existing = std::fs::read_to_string(project_nix_path()).map_err(CliError::ReadNix)?;
+    let existing = std::fs::read_to_string(&paths.nix_path).map_err(CliError::ReadNix)?;
     let parsed_generated = parse_nix_file(&generated).map_err(CliError::NixParse)?;
     let parsed_existing = parse_nix_file(&existing).map_err(CliError::NixParse)?;
 
@@ -3373,45 +4733,54 @@ fn diff_project(state: &ProjectState) -> Result<(), CliError> {
         || override_shellhook_changed
         || override_merge_changed)
     {
-        println!("no drift detected");
+        output.info("no drift detected");
     } else {
-        println!("drift detected:");
-        println!("  pin: {}", if pin_changed { "changed" } else { "ok" });
-        println!("  let: {}", if let_changed { "changed" } else { "ok" });
-        println!(
+        output.info("drift detected:");
+        output.info(format!(
+            "  pin: {}",
+            if pin_changed { "changed" } else { "ok" }
+        ));
+        output.info(format!(
+            "  let: {}",
+            if let_changed { "changed" } else { "ok" }
+        ));
+        output.info(format!(
             "  packages: {}",
             if packages_changed { "changed" } else { "ok" }
-        );
-        println!("  env: {}", if env_changed { "changed" } else { "ok" });
-        println!(
+        ));
+        output.info(format!(
+            "  env: {}",
+            if env_changed { "changed" } else { "ok" }
+        ));
+        output.info(format!(
             "  shellHook: {}",
             if shell_changed { "changed" } else { "ok" }
-        );
-        println!(
+        ));
+        output.info(format!(
             "  override: {}",
             if override_changed { "changed" } else { "ok" }
-        );
-        println!(
+        ));
+        output.info(format!(
             "  override shellHook: {}",
             if override_shellhook_changed {
                 "changed"
             } else {
                 "ok"
             }
-        );
-        println!(
+        ));
+        output.info(format!(
             "  override merge: {}",
             if override_merge_changed {
                 "changed"
             } else {
                 "ok"
             }
-        );
+        ));
     }
     Ok(())
 }
 
-fn diff_profile(state: &GlobalProfileState) -> Result<(), CliError> {
+fn diff_profile(output: &Output, state: &GlobalProfileState) -> Result<(), CliError> {
     ensure_pin_complete(&state.pin)?;
     let presets = load_all_presets()?;
     let mut preset_map = BTreeMap::new();
@@ -3435,21 +4804,32 @@ fn diff_profile(state: &GlobalProfileState) -> Result<(), CliError> {
     let paths_changed = parsed_generated.paths_section != parsed_existing.paths_section;
 
     if !(pins_changed || paths_changed) {
-        println!("no drift detected");
+        output.info("no drift detected");
     } else {
-        println!("drift detected:");
-        println!("  pins: {}", if pins_changed { "changed" } else { "ok" });
-        println!("  paths: {}", if paths_changed { "changed" } else { "ok" });
+        output.info("drift detected:");
+        output.info(format!(
+            "  pins: {}",
+            if pins_changed { "changed" } else { "ok" }
+        ));
+        output.info(format!(
+            "  paths: {}",
+            if paths_changed { "changed" } else { "ok" }
+        ));
     }
     Ok(())
 }
 
-fn update_project_state_from_nix(state: &mut ProjectState) -> Result<(), CliError> {
-    let content = std::fs::read_to_string(project_nix_path()).map_err(CliError::ReadNix)?;
+fn update_project_state_from_nix(
+    paths: &ProjectPaths,
+    state: &mut ProjectState,
+) -> Result<(), CliError> {
+    let content = std::fs::read_to_string(&paths.nix_path).map_err(CliError::ReadNix)?;
     let parsed = parse_project_state_from_nix(&content).map_err(CliError::NixStateParse)?;
     state.pin = parsed.pin;
     state.pins = parsed.pins;
-    state.packages.added = compute_added_packages(parsed.packages, &parsed.presets)?;
+    state.packages.pinned = parsed.pinned;
+    state.packages.added =
+        compute_added_packages(parsed.packages, &parsed.presets, &state.packages.pinned)?;
     state.env = parsed.env;
     state.shell.hook = parsed.shell_hook;
     state.presets.active = parsed.presets;
@@ -3462,6 +4842,7 @@ fn update_profile_state_from_nix(state: &mut GlobalProfileState) -> Result<(), C
     let content = std::fs::read_to_string(profile_nix_path()?).map_err(CliError::ReadNix)?;
     let parsed = parse_profile_state_from_nix(&content).map_err(CliError::NixStateParse)?;
     state.pin = parsed.pin;
+    state.packages.pinned = parsed.pinned;
     state.packages.added = parsed.packages;
     update_profile_modified(state);
     Ok(())
@@ -3603,12 +4984,62 @@ fn latest_rev_from_github(
 
 fn fetch_latest_github_rev(url: &str, branch: &str) -> Result<String, CliError> {
     let (owner, repo) = parse_github_repo(url)?;
-    let branch = if branch.trim().is_empty() {
+    let requested_branch = if branch.trim().is_empty() {
         "main"
     } else {
-        branch
+        branch.trim()
     };
-    let ref_encoded = encode_github_ref(branch);
+    let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
+
+    match fetch_github_commit_sha(&client, &owner, &repo, requested_branch) {
+        Ok(rev) => Ok(rev),
+        Err(CliError::GitHubApiStatus(status, body))
+            if should_retry_default_branch_lookup(status, &body) =>
+        {
+            let default_branch = fetch_github_default_branch(&client, &owner, &repo)?;
+            if default_branch.trim().is_empty() || default_branch == requested_branch {
+                return Err(CliError::GitHubApiStatus(status, body));
+            }
+            fetch_github_commit_sha(&client, &owner, &repo, &default_branch)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn fetch_github_commit_sha(
+    client: &Client,
+    owner: &str,
+    repo: &str,
+    reference: &str,
+) -> Result<String, CliError> {
+    let ref_encoded = encode_github_ref(reference);
+    let api_url = format!(
+        "https://api.github.com/repos/{}/{}/commits/{}",
+        owner, repo, ref_encoded
+    );
+    let response = client
+        .get(&api_url)
+        .header("User-Agent", format!("mica/{}", env!("CARGO_PKG_VERSION")))
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .send()?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().unwrap_or_default();
+        return Err(CliError::GitHubApiStatus(status, body));
+    }
+
+    let commit: GitHubCommit = response.json()?;
+    if commit.sha.trim().is_empty() {
+        return Err(CliError::GitHubApiMissingSha);
+    }
+    Ok(commit.sha)
+}
+
+fn fetch_github_commit_date(url: &str, rev: &str) -> Result<String, CliError> {
+    let (owner, repo) = parse_github_repo(url)?;
+    let ref_encoded = encode_github_ref(rev);
     let api_url = format!(
         "https://api.github.com/repos/{}/{}/commits/{}",
         owner, repo, ref_encoded
@@ -3628,10 +5059,48 @@ fn fetch_latest_github_rev(url: &str, branch: &str) -> Result<String, CliError> 
     }
 
     let commit: GitHubCommit = response.json()?;
-    if commit.sha.trim().is_empty() {
-        return Err(CliError::GitHubApiMissingSha);
+    if let Some(committer) = commit.commit.committer {
+        if !committer.date.trim().is_empty() {
+            return Ok(committer.date);
+        }
     }
-    Ok(commit.sha)
+    if let Some(author) = commit.commit.author {
+        if !author.date.trim().is_empty() {
+            return Ok(author.date);
+        }
+    }
+
+    Err(CliError::GitHubApiMissingDate)
+}
+
+fn fetch_github_default_branch(
+    client: &Client,
+    owner: &str,
+    repo: &str,
+) -> Result<String, CliError> {
+    let api_url = format!("https://api.github.com/repos/{}/{}", owner, repo);
+    let response = client
+        .get(&api_url)
+        .header("User-Agent", format!("mica/{}", env!("CARGO_PKG_VERSION")))
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .send()?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().unwrap_or_default();
+        return Err(CliError::GitHubApiStatus(status, body));
+    }
+
+    let repo_info: GitHubRepoInfo = response.json()?;
+    if repo_info.default_branch.trim().is_empty() {
+        return Err(CliError::GitHubApiMissingDefaultBranch);
+    }
+    Ok(repo_info.default_branch)
+}
+
+fn should_retry_default_branch_lookup(status: reqwest::StatusCode, body: &str) -> bool {
+    status == reqwest::StatusCode::UNPROCESSABLE_ENTITY && body.contains("No commit found for SHA")
 }
 
 fn fetch_nix_sha256(url: &str, rev: &str) -> Result<String, CliError> {
@@ -3886,13 +5355,20 @@ fn update_project_pin_stub(
             let entry = state
                 .packages
                 .pinned
-                .entry(name)
+                .entry(name.clone())
                 .or_insert_with(|| PinnedPackage {
-                    version: "CHANGEME".to_string(),
+                    version: String::new(),
                     pin: state.pin.clone(),
                 });
             update_pin_fields(&mut entry.pin, url, rev, sha256, branch);
             entry.pin.updated = now.date_naive();
+            state.packages.added.retain(|pkg| pkg != &name);
+            state.packages.removed.retain(|pkg| pkg != &name);
+            if let Some(version) = resolve_pinned_version(&name, &entry.pin)? {
+                entry.version = version;
+            } else if entry.version.trim().is_empty() {
+                entry.version = "CHANGEME".to_string();
+            }
         }
     }
     update_project_modified(state);
@@ -3917,32 +5393,89 @@ fn update_profile_pin_stub(
             let entry = state
                 .packages
                 .pinned
-                .entry(name)
+                .entry(name.clone())
                 .or_insert_with(|| PinnedPackage {
-                    version: "CHANGEME".to_string(),
+                    version: String::new(),
                     pin: state.pin.clone(),
                 });
             update_pin_fields(&mut entry.pin, url, rev, sha256, branch);
             entry.pin.updated = now.date_naive();
+            state.packages.added.retain(|pkg| pkg != &name);
+            state.packages.removed.retain(|pkg| pkg != &name);
+            if let Some(version) = resolve_pinned_version(&name, &entry.pin)? {
+                entry.version = version;
+            } else if entry.version.trim().is_empty() {
+                entry.version = "CHANGEME".to_string();
+            }
         }
     }
     update_profile_modified(state);
     Ok(())
 }
 
-fn project_nix_path() -> PathBuf {
-    PathBuf::from("default.nix")
-}
-
-fn project_dir_name() -> String {
-    std::env::current_dir()
-        .ok()
-        .and_then(|path| {
-            path.file_name()
-                .map(|name| name.to_string_lossy().to_string())
-        })
+fn project_dir_name(paths: &ProjectPaths) -> String {
+    paths
+        .root_dir
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
         .filter(|name| !name.trim().is_empty())
         .unwrap_or_else(|| "dev-environment".to_string())
+}
+
+fn index_display_name_for_url(url: &str) -> String {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return "jpetrucciani/nix".to_string();
+    }
+    if let Some(pos) = trimmed.find("github.com/") {
+        let mut tail = &trimmed[pos + "github.com/".len()..];
+        if let Some(idx) = tail.find('#') {
+            tail = &tail[..idx];
+        }
+        if let Some(idx) = tail.find('?') {
+            tail = &tail[..idx];
+        }
+        for marker in ["/archive/", "/tarball/", "/commit/", "/tree/", "/releases/"] {
+            if let Some(idx) = tail.find(marker) {
+                tail = &tail[..idx];
+                break;
+            }
+        }
+        let tail = tail.trim_end_matches(".git");
+        let parts: Vec<&str> = tail.split('/').filter(|part| !part.is_empty()).collect();
+        if parts.len() >= 2 {
+            return format!("{}/{}", parts[0], parts[1]);
+        }
+    }
+    trimmed.to_string()
+}
+
+fn pin_branch_label(pin: &Pin) -> String {
+    if pin.branch.trim().is_empty() {
+        "main".to_string()
+    } else {
+        pin.branch.clone()
+    }
+}
+
+fn pin_source_label(pin: &Pin) -> String {
+    let repo = index_display_name_for_url(&pin.url);
+    let branch = pin_branch_label(pin);
+    format!("{}@{}", repo, branch)
+}
+
+fn pin_commit_date(output: &Output, pin: &Pin) -> String {
+    match fetch_github_commit_date(&pin.url, &pin.rev) {
+        Ok(date) => date,
+        Err(err) => {
+            output.warn(format!(
+                "warning: failed to fetch commit date for {}@{}: {}",
+                pin.url, pin.rev, err
+            ));
+            let fallback = pin.updated.and_hms_opt(0, 0, 0).unwrap();
+            chrono::DateTime::<Utc>::from_naive_utc_and_offset(fallback, Utc).to_rfc3339()
+        }
+    }
 }
 
 fn presets_path() -> PathBuf {
@@ -3971,9 +5504,13 @@ fn load_config_or_default() -> Result<Config, CliError> {
 fn compute_added_packages(
     packages: Vec<String>,
     presets: &[String],
+    pinned: &BTreeMap<String, PinnedPackage>,
 ) -> Result<Vec<String>, CliError> {
     if presets.is_empty() {
-        return Ok(packages);
+        return Ok(packages
+            .into_iter()
+            .filter(|pkg| !pinned.contains_key(pkg))
+            .collect());
     }
     let presets_def = load_all_presets()?;
     let mut preset_map = BTreeMap::new();
@@ -3990,7 +5527,7 @@ fn compute_added_packages(
     }
     Ok(packages
         .into_iter()
-        .filter(|pkg| !preset_packages.contains(pkg))
+        .filter(|pkg| !preset_packages.contains(pkg) && !pinned.contains_key(pkg))
         .collect())
 }
 
@@ -4028,6 +5565,10 @@ fn config_dir() -> Result<PathBuf, CliError> {
     home_dir().map(|home| home.join(".config").join("mica"))
 }
 
+fn cache_dir() -> Result<PathBuf, CliError> {
+    Ok(config_dir()?.join("cache"))
+}
+
 fn config_path() -> Result<PathBuf, CliError> {
     Ok(config_dir()?.join("config.toml"))
 }
@@ -4041,7 +5582,11 @@ fn profile_nix_path() -> Result<PathBuf, CliError> {
 }
 
 fn index_db_path() -> Result<PathBuf, CliError> {
-    Ok(config_dir()?.join("cache").join("index.db"))
+    Ok(cache_dir()?.join("index.db"))
+}
+
+fn versions_db_path() -> Result<PathBuf, CliError> {
+    Ok(cache_dir()?.join("versions.db"))
 }
 
 fn home_dir() -> Result<PathBuf, CliError> {
@@ -4050,53 +5595,83 @@ fn home_dir() -> Result<PathBuf, CliError> {
         .map_err(|_| CliError::MissingHome)
 }
 
-fn print_project_state(state: &ProjectState) {
-    println!("mode: project");
-    println!("pin: {} @ {}", state.pin.url, state.pin.rev);
+fn print_project_state(output: &Output, state: &ProjectState) {
+    output.info("mode: project");
+    output.info(format!("pin: {} @ {}", state.pin.url, state.pin.rev));
     if !state.pins.is_empty() {
-        println!("pins:");
+        output.info("pins:");
         for (name, pin) in &state.pins {
-            println!("  {} -> {} ({})", name, pin.url, pin.rev);
+            output.info(format!("  {} -> {} ({})", name, pin.url, pin.rev));
         }
     }
-    println!("presets: {}", state.presets.active.join(", "));
-    println!("packages (added): {}", state.packages.added.join(", "));
-    println!("packages (removed): {}", state.packages.removed.join(", "));
+    output.info(format!("presets: {}", state.presets.active.join(", ")));
+    output.info(format!(
+        "packages (added): {}",
+        state.packages.added.join(", ")
+    ));
+    output.info(format!(
+        "packages (removed): {}",
+        state.packages.removed.join(", ")
+    ));
     if !state.packages.pinned.is_empty() {
-        println!("packages (pinned):");
+        output.info("packages (pinned):");
         for (name, pinned) in &state.packages.pinned {
-            println!("  {} -> {} ({})", name, pinned.version, pinned.pin.rev);
+            output.info(format!(
+                "  {} -> {} ({})",
+                name, pinned.version, pinned.pin.rev
+            ));
         }
     }
     if !state.env.is_empty() {
-        println!("env:");
+        output.info("env:");
         for (key, value) in &state.env {
-            println!("  {}={}", key, value);
+            let display = env_value_for_editor(value);
+            let suffix =
+                if env_value_mode_from_stored(value) == tui::app::EnvValueMode::NixExpression {
+                    " [expr]"
+                } else {
+                    ""
+                };
+            output.info(format!("  {}={}{}", key, display, suffix));
         }
     }
     if let Some(hook) = &state.shell.hook {
-        println!("shellHook:");
-        println!("{}", hook);
+        output.info("shellHook:");
+        output.info(hook);
     }
 }
 
-fn print_profile_state(state: &GlobalProfileState) {
-    println!("mode: global");
-    println!("pin: {} @ {}", state.pin.url, state.pin.rev);
-    println!("presets: {}", state.presets.active.join(", "));
-    println!("packages (added): {}", state.packages.added.join(", "));
-    println!("packages (removed): {}", state.packages.removed.join(", "));
+fn print_profile_state(output: &Output, state: &GlobalProfileState) {
+    output.info("mode: global");
+    output.info(format!("pin: {} @ {}", state.pin.url, state.pin.rev));
+    output.info(format!("presets: {}", state.presets.active.join(", ")));
+    output.info(format!(
+        "packages (added): {}",
+        state.packages.added.join(", ")
+    ));
+    output.info(format!(
+        "packages (removed): {}",
+        state.packages.removed.join(", ")
+    ));
     if !state.packages.pinned.is_empty() {
-        println!("packages (pinned):");
+        output.info("packages (pinned):");
         for (name, pinned) in &state.packages.pinned {
-            println!("  {} -> {} ({})", name, pinned.version, pinned.pin.rev);
+            output.info(format!(
+                "  {} -> {} ({})",
+                name, pinned.version, pinned.pin.rev
+            ));
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_github_repo, CliError};
+    use crate::{
+        encode_env_editor_value, env_value_for_editor, env_value_mode_from_stored,
+        parse_github_repo, should_retry_default_branch_lookup, Cli, CliError, Command,
+    };
+    use clap::Parser;
+    use mica_core::state::NIX_EXPR_PREFIX;
 
     #[test]
     fn parse_github_repo_https() {
@@ -4118,5 +5693,65 @@ mod tests {
     fn parse_github_repo_rejects_non_github() {
         let result = parse_github_repo("https://example.com/jpetrucciani/nix");
         assert!(matches!(result, Err(CliError::InvalidGitHubUrl(_))));
+    }
+
+    #[test]
+    fn cli_accepts_no_subcommand_for_tui_default() {
+        let cli = Cli::try_parse_from(["mica"]).expect("parse failed");
+        assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn cli_parses_presets_subcommand() {
+        let cli = Cli::try_parse_from(["mica", "presets"]).expect("parse failed");
+        assert!(matches!(cli.command, Some(Command::Presets)));
+    }
+
+    #[test]
+    fn retry_default_branch_lookup_when_commit_is_missing_for_sha() {
+        let body = r#"{"message":"No commit found for SHA: main"}"#;
+        assert!(should_retry_default_branch_lookup(
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+            body
+        ));
+    }
+
+    #[test]
+    fn does_not_retry_default_branch_lookup_for_other_errors() {
+        let body = r#"{"message":"Validation Failed"}"#;
+        assert!(!should_retry_default_branch_lookup(
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+            body
+        ));
+        assert!(!should_retry_default_branch_lookup(
+            reqwest::StatusCode::NOT_FOUND,
+            r#"{"message":"Not Found"}"#
+        ));
+    }
+
+    #[test]
+    fn env_expression_values_round_trip_through_editor_helpers() {
+        let stored = format!("{}${{pkgs.path}}/meme", NIX_EXPR_PREFIX);
+        assert_eq!(
+            env_value_mode_from_stored(&stored),
+            crate::tui::app::EnvValueMode::NixExpression
+        );
+        assert_eq!(env_value_for_editor(&stored), "${pkgs.path}/meme");
+    }
+
+    #[test]
+    fn encode_env_editor_value_marks_nix_expressions() {
+        let encoded = encode_env_editor_value(
+            "pkgs.path + \"/meme\"",
+            crate::tui::app::EnvValueMode::NixExpression,
+        )
+        .expect("encode should succeed");
+        assert_eq!(encoded, format!("{}pkgs.path + \"/meme\"", NIX_EXPR_PREFIX));
+    }
+
+    #[test]
+    fn encode_env_editor_value_rejects_empty_expression() {
+        let result = encode_env_editor_value("   ", crate::tui::app::EnvValueMode::NixExpression);
+        assert!(result.is_err());
     }
 }

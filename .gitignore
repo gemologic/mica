@@ -26,6 +26,9 @@ dist
 
 # Node dependencies
 node_modules
+node_modules/
+docs/.vitepress/dist
+docs/.vitepress/cache
 
 # Logs
 logs

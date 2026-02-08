@@ -1,12 +1,13 @@
 use crate::tui::app::{
-    App, EnvEditMode, FilterKind, Focus, Overlay, PackageEntry, PinField, PresetEntry, Toast,
-    ToastLevel,
+    App, EnvEditMode, EnvValueMode, FilterKind, Focus, Overlay, PackageEntry, PinField,
+    PresetEntry, Toast, ToastLevel,
 };
+use mica_core::state::NIX_EXPR_PREFIX;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
-    Block, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, Wrap,
+    Block, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState, Wrap,
 };
 use ratatui::Frame;
 
@@ -121,13 +122,7 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect) {
             .constraints([Constraint::Min(0), right])
             .split(area);
 
-        let left = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(3), Constraint::Min(0)])
-            .split(columns[0]);
-
-        render_package_search(frame, app, left[0]);
-        render_package_table(frame, app, left[1]);
+        render_package_column(frame, app, columns[0]);
 
         let right = Layout::default()
             .direction(Direction::Vertical)
@@ -142,16 +137,27 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect) {
             .constraints(body_constraints(app))
             .split(area);
 
-        let left = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(3), Constraint::Min(0)])
-            .split(columns[0]);
-
-        render_package_search(frame, app, left[0]);
-        render_package_table(frame, app, left[1]);
+        render_package_column(frame, app, columns[0]);
 
         render_presets_column(frame, app, columns[1]);
         render_changes_column(frame, app, columns[2]);
+    }
+}
+
+fn render_package_column(frame: &mut Frame, app: &mut App, area: Rect) {
+    let mut constraints = vec![Constraint::Length(3), Constraint::Min(0)];
+    if app.show_details {
+        constraints.push(Constraint::Length(7));
+    }
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(area);
+
+    render_package_search(frame, app, layout[0]);
+    render_package_table(frame, app, layout[1]);
+    if app.show_details {
+        render_package_details(frame, app, layout[2]);
     }
 }
 
@@ -171,7 +177,8 @@ fn render_package_search(frame: &mut Frame, app: &App, area: Rect) {
 
     let title_left = format!("[P]ackages search{}", filter_summary);
     let title_right = format!(
-        "B:{} I:{} V:{}",
+        "S:{} B:{} I:{} V:{}",
+        app.search_mode_label(),
         if app.filters.show_broken { "on" } else { "off" },
         if app.filters.show_insecure {
             "on"
@@ -302,6 +309,43 @@ fn render_package_table(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_stateful_widget(table, area, &mut app.packages_state);
 }
 
+fn render_package_details(frame: &mut Frame, app: &App, area: Rect) {
+    let mut lines = Vec::new();
+    if let Some(pkg) = app.current_package() {
+        let title = pkg.name.clone();
+        let version = pkg.version.clone().unwrap_or_else(|| "unknown".to_string());
+        lines.push(Line::from(Span::styled(
+            format!("{} ({})", title, version),
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+        if let Some(description) = pkg.description.as_ref() {
+            if !description.trim().is_empty() {
+                lines.push(Line::from(description.clone()));
+            }
+        }
+        lines.push(Line::from(format!("attr: {}", pkg.attr_path)));
+        lines.push(Line::from(format!(
+            "main: {}",
+            pkg.main_program.as_deref().unwrap_or("-")
+        )));
+        lines.push(Line::from(format!(
+            "license: {}",
+            pkg.license.as_deref().unwrap_or("-")
+        )));
+        lines.push(Line::from(format!(
+            "platforms: {}",
+            pkg.platforms.as_deref().unwrap_or("-")
+        )));
+    } else {
+        lines.push(Line::from("No package selected"));
+    }
+
+    let details = Paragraph::new(Text::from(lines))
+        .block(Block::default().title("Details").borders(Borders::ALL))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(details, area);
+}
+
 fn render_preset_search(frame: &mut Frame, app: &App, area: Rect) {
     let title = "[T]emplates search";
     let border_style = focus_border_style(app, Focus::Presets);
@@ -362,6 +406,18 @@ fn render_preset_details(frame: &mut Frame, app: &App, area: Rect) {
                 lines.push(Line::from(format!("... +{} more", remaining)));
             }
         }
+        if !preset.packages_optional.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::from("Optional packages:"));
+            let max = 4usize;
+            for pkg in preset.packages_optional.iter().take(max) {
+                lines.push(Line::from(format!("- {}", pkg)));
+            }
+            if preset.packages_optional.len() > max {
+                let remaining = preset.packages_optional.len() - max;
+                lines.push(Line::from(format!("... +{} more", remaining)));
+            }
+        }
     } else {
         lines.push(Line::from("No template selected"));
     }
@@ -417,6 +473,7 @@ fn render_overlay(frame: &mut Frame, app: &App, overlay: &Overlay) {
     match overlay {
         Overlay::Help => render_help_overlay(frame),
         Overlay::PackageInfo(state) => render_package_info_overlay(frame, state),
+        Overlay::VersionPicker(state) => render_version_picker_overlay(frame, state),
         Overlay::PinEditor(state) => render_pin_editor_overlay(frame, state),
         Overlay::Columns(state) => render_columns_overlay(frame, app, state),
         Overlay::Filter(state) => render_filter_overlay(frame, state),
@@ -466,9 +523,18 @@ fn render_help_overlay(frame: &mut Frame) {
             Span::raw("search (focused panel)"),
         ]),
         Row::new(vec![
+            Span::styled("Query", key_style),
+            Span::raw("shortcuts: 'exact, bin:, name:, desc:, all:"),
+        ]),
+        Row::new(vec![
+            Span::styled("Example", key_style),
+            Span::raw("'bin:rg = exact main program, name:ripgrep = name-only"),
+        ]),
+        Row::new(vec![
             Span::styled("Ctrl+U", key_style),
             Span::raw("clear search"),
         ]),
+        Row::new(vec![Span::styled("S", key_style), Span::raw("search mode")]),
         Row::new(vec![
             Span::styled("Esc/?", key_style),
             Span::raw("close overlay"),
@@ -480,6 +546,10 @@ fn render_help_overlay(frame: &mut Frame) {
         Row::new(vec![
             Span::styled("Ctrl+P", key_style),
             Span::raw("package info"),
+        ]),
+        Row::new(vec![
+            Span::styled("Ctrl+V", key_style),
+            Span::raw("version picker"),
         ]),
         Row::new(vec![
             Span::styled("Ctrl+N", key_style),
@@ -535,7 +605,15 @@ fn render_help_overlay(frame: &mut Frame) {
             Span::styled("C", key_style),
             Span::raw("toggle changes"),
         ]),
+        Row::new(vec![
+            Span::styled("K", key_style),
+            Span::raw("toggle details"),
+        ]),
         Row::new(vec![Span::styled("E", key_style), Span::raw("edit env")]),
+        Row::new(vec![
+            Span::styled("Tab", key_style),
+            Span::raw("in env edit: toggle string/expr mode"),
+        ]),
         Row::new(vec![
             Span::styled("H", key_style),
             Span::raw("edit shell hook"),
@@ -631,6 +709,59 @@ fn render_package_info_overlay(frame: &mut Frame, state: &crate::tui::app::Packa
     frame.render_widget(paragraph, area);
 }
 
+fn render_version_picker_overlay(frame: &mut Frame, state: &crate::tui::app::VersionPickerState) {
+    let area = centered_rect(80, 80, frame.area());
+    frame.render_widget(Clear, area);
+
+    let mut list_state = TableState::default();
+    if !state.entries.is_empty() {
+        list_state.select(Some(state.cursor));
+    }
+
+    let rows: Vec<Row> = state
+        .entries
+        .iter()
+        .map(|entry| {
+            let short_commit = entry.commit.chars().take(8).collect::<String>();
+            Row::new(vec![
+                Cell::from(entry.source.clone()),
+                Cell::from(entry.version.clone()),
+                Cell::from(entry.commit_date.clone()),
+                Cell::from(short_commit),
+            ])
+        })
+        .collect();
+
+    let header = Row::new(vec!["Source", "Version", "Date", "Commit"])
+        .style(Style::default().add_modifier(Modifier::BOLD));
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Percentage(35),
+            Constraint::Length(12),
+            Constraint::Length(20),
+            Constraint::Length(10),
+        ],
+    )
+    .header(header)
+    .block(
+        Block::default()
+            .title(format!(
+                "Versions for {} (Enter to pin, Esc to close)",
+                state.package
+            ))
+            .borders(Borders::ALL),
+    )
+    .row_highlight_style(
+        Style::default()
+            .bg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    );
+
+    frame.render_stateful_widget(table, area, &mut list_state);
+}
+
 fn render_pin_editor_overlay(frame: &mut Frame, state: &crate::tui::app::PinEditorState) {
     let area = centered_rect(80, 70, frame.area());
     frame.render_widget(Clear, area);
@@ -706,15 +837,27 @@ fn render_env_overlay(frame: &mut Frame, state: &crate::tui::app::EnvEditorState
     let area = centered_rect(80, 70, frame.area());
     frame.render_widget(Clear, area);
 
+    let input_height = if state.error.is_some() { 4 } else { 3 };
     let layout = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(3)])
+        .constraints([Constraint::Min(0), Constraint::Length(input_height)])
         .split(area);
 
     let items: Vec<ListItem> = state
         .entries
         .iter()
-        .map(|(key, value)| ListItem::new(Line::from(format!("{}={}", key, value))))
+        .map(|entry| {
+            let value = env_value_for_display(&entry.value);
+            let mode_suffix = if env_value_is_nix_expression(&entry.value) {
+                " [expr]"
+            } else {
+                ""
+            };
+            ListItem::new(Line::from(format!(
+                "{}={}{}",
+                entry.key, value, mode_suffix
+            )))
+        })
         .collect();
 
     let mut list_state = ListState::default();
@@ -731,12 +874,24 @@ fn render_env_overlay(frame: &mut Frame, state: &crate::tui::app::EnvEditorState
         );
     frame.render_stateful_widget(list, layout[0], &mut list_state);
 
-    let (input_title, input_line) = match state.mode {
-        EnvEditMode::List => ("a add | Enter edit | d delete | Esc close", Line::from("")),
-        EnvEditMode::Edit { .. } => (
-            "Editing (KEY=VALUE), Enter save, Esc cancel",
-            render_input_with_cursor(&state.input, state.input_cursor),
+    let (input_title, input_line) = match &state.mode {
+        EnvEditMode::List => (
+            "a add | Enter edit | d delete | Esc close".to_string(),
+            Line::from(""),
         ),
+        EnvEditMode::Edit { value_mode, .. } => {
+            let mode = match value_mode {
+                EnvValueMode::String => "string",
+                EnvValueMode::NixExpression => "nix expr",
+            };
+            (
+                format!(
+                    "Editing (KEY=VALUE), mode: {} (Tab toggles), Enter save, Esc cancel",
+                    mode
+                ),
+                render_input_with_cursor(&state.input, state.input_cursor),
+            )
+        }
     };
 
     let mut input_lines = Vec::new();
@@ -745,14 +900,23 @@ fn render_env_overlay(frame: &mut Frame, state: &crate::tui::app::EnvEditorState
             error.clone(),
             Style::default().fg(Color::Red),
         )));
-    } else {
-        input_lines.push(Line::from(""));
     }
     input_lines.push(input_line);
 
     let input = Paragraph::new(Text::from(input_lines))
         .block(Block::default().title(input_title).borders(Borders::ALL));
     frame.render_widget(input, layout[1]);
+}
+
+fn env_value_is_nix_expression(value: &str) -> bool {
+    value.starts_with(NIX_EXPR_PREFIX)
+}
+
+fn env_value_for_display(value: &str) -> String {
+    value
+        .strip_prefix(NIX_EXPR_PREFIX)
+        .unwrap_or(value)
+        .to_string()
 }
 
 fn render_shell_overlay(frame: &mut Frame, state: &crate::tui::app::ShellEditorState) {
@@ -870,12 +1034,16 @@ fn focus_border_style(app: &App, focus: Focus) -> Style {
 }
 
 fn package_row(app: &App, pkg: &PackageEntry) -> Row<'static> {
-    let is_removed = app.removed.contains(&pkg.name);
-    let is_added = app.added.contains(&pkg.name);
-    let is_preset = app.preset_packages.contains(&pkg.name);
+    let base_attr = app.base_attr_for(&pkg.attr_path);
+    let is_removed = app.removed.contains(&base_attr);
+    let is_added = app.added.contains(&base_attr);
+    let is_preset = app.preset_packages.contains(&base_attr);
+    let is_pinned = app.pinned.contains_key(&base_attr);
 
     let marker = if is_removed {
         "[-]"
+    } else if is_pinned {
+        "[p]"
     } else if is_added {
         "[+]"
     } else if is_preset {
@@ -894,6 +1062,8 @@ fn package_row(app: &App, pkg: &PackageEntry) -> Row<'static> {
 
     let marker_style = if is_removed {
         Style::default().fg(Color::Red)
+    } else if is_pinned {
+        Style::default().fg(Color::Magenta)
     } else if is_added {
         Style::default().fg(Color::Green)
     } else if is_preset {
@@ -978,13 +1148,39 @@ fn build_changes_lines(app: &App, max_items: usize) -> Vec<Line<'static>> {
         .cloned()
         .collect();
 
+    let mut pinned_added = Vec::new();
+    let mut pinned_removed = Vec::new();
+    let mut pinned_changed = Vec::new();
+    for (name, pinned) in &app.pinned {
+        match app.base_pinned.get(name) {
+            None => pinned_added.push(format!("{} ({})", name, pinned.version)),
+            Some(existing) if existing != pinned => {
+                pinned_changed.push(format!("{} ({})", name, pinned.version))
+            }
+            _ => {}
+        }
+    }
+    for name in app.base_pinned.keys() {
+        if !app.pinned.contains_key(name) {
+            pinned_removed.push(name.clone());
+        }
+    }
+
     let mut env_added = Vec::new();
     let mut env_removed = Vec::new();
     let mut env_changed = Vec::new();
     for (key, value) in &app.env {
+        let display = env_value_for_display(value);
+        let suffix = if env_value_is_nix_expression(value) {
+            " [expr]"
+        } else {
+            ""
+        };
         match app.base_env.get(key) {
-            None => env_added.push(format!("{}={}", key, value)),
-            Some(existing) if existing != value => env_changed.push(format!("{}={}", key, value)),
+            None => env_added.push(format!("{}={}{}", key, display, suffix)),
+            Some(existing) if existing != value => {
+                env_changed.push(format!("{}={}{}", key, display, suffix))
+            }
             _ => {}
         }
     }
@@ -1007,6 +1203,14 @@ fn build_changes_lines(app: &App, max_items: usize) -> Vec<Line<'static>> {
     )));
     push_change_lines(&mut lines, "+", &presets_on, max_items, Color::Green);
     push_change_lines(&mut lines, "-", &presets_off, max_items, Color::Red);
+
+    lines.push(Line::from(Span::styled(
+        "Pinned",
+        Style::default().add_modifier(Modifier::BOLD),
+    )));
+    push_change_lines(&mut lines, "+", &pinned_added, max_items, Color::Green);
+    push_change_lines(&mut lines, "-", &pinned_removed, max_items, Color::Red);
+    push_change_lines(&mut lines, "~", &pinned_changed, max_items, Color::Yellow);
 
     lines.push(Line::from(Span::styled(
         "Env",
