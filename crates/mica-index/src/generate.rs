@@ -603,17 +603,22 @@ mod tests {
         NixPackage, SearchMode,
     };
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static NEXT_TEMP_DB_ID: AtomicU64 = AtomicU64::new(0);
 
     fn temp_db_path() -> PathBuf {
         let suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock drift")
             .as_nanos();
+        let id = NEXT_TEMP_DB_ID.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!(
-            "mica-index-ingest-{}-{}.db",
+            "mica-index-ingest-{}-{}-{}.db",
             std::process::id(),
-            suffix
+            suffix,
+            id
         ))
     }
 
@@ -667,6 +672,7 @@ mod tests {
         let beta_hits = search_packages(&conn, "beta", 10).expect("beta search failed");
         assert!(beta_hits.is_empty());
 
+        drop(conn);
         let _ = std::fs::remove_file(path);
     }
 
@@ -709,6 +715,7 @@ mod tests {
             .expect("exact binary miss search failed");
         assert!(bin_exact_miss.is_empty());
 
+        drop(conn);
         let _ = std::fs::remove_file(path);
     }
 }
