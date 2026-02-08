@@ -3,16 +3,19 @@
 ## Prerequisites
 
 - Nix installed with `nix-env` and `nix-prefetch-url` available in `PATH`
-- Rust toolchain if you are running from source
 - Optional: `direnv` for shell ergonomics
 
-## Run From Source
-
-From the repository root:
+## Install
 
 ```bash
-cargo run -p mica -- init
-cargo run -p mica -- tui
+nix-env -f https://github.com/jpetrucciani/nix/archive/main.tar.gz -iA mica
+```
+
+## Run
+
+```bash
+mica init
+mica tui
 ```
 
 `init` creates a mica-managed `default.nix` in the target directory. `tui` opens the interactive interface.

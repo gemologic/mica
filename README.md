@@ -14,12 +14,17 @@ A TUI for managing Nix environments. Mica lets you search packages, apply preset
 
 **Requirements**
 - Nix installed, with `nix-env` and `nix-prefetch-url` available
-- Rust toolchain to build and run
+- Optional: Rust toolchain for development from source
 - Optional: direnv for project shells
 
+**Install**
+```bash
+nix-env -f https://github.com/jpetrucciani/nix/archive/main.tar.gz -iA mica
+```
+
 **Quick Start (Project Mode)**
-1. In a project directory without an existing managed `default.nix`, run `cargo run -p mica -- init`
-2. Launch the TUI with `cargo run -p mica -- tui`
+1. In a project directory without an existing managed `default.nix`, run `mica init`
+2. Launch the TUI with `mica tui`
 3. In the TUI, search packages, toggle selections, and press `Ctrl+S` to save
 
 **Targeting Examples (`--file`, `--global`)**
