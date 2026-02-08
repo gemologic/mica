@@ -6042,14 +6042,11 @@ mod tests {
     }
 
     #[test]
-    fn resolve_remote_index_urls_prefers_commit_then_fallback() {
+    fn resolve_remote_index_urls_uses_commit_for_base_url() {
         let urls = resolve_remote_index_urls("https://static.g7c.us/mica", Some("abcd1234"));
         assert_eq!(
             urls,
-            vec![
-                "https://static.g7c.us/mica/abcd1234.db".to_string(),
-                "https://static.g7c.us/mica/index.db".to_string()
-            ]
+            vec!["https://static.g7c.us/mica/abcd1234.db".to_string()]
         );
     }
 

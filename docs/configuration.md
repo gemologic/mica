@@ -32,7 +32,7 @@ main_program = false
 
 `index.remote_url` behavior:
 
-- If it is a base URL, mica tries `REMOTE/<nixpkgs_commit>.db` first, then `REMOTE/index.db`.
+- If it is a base URL, mica tries `REMOTE/<nixpkgs_commit>.db`.
 - If it already ends in `.db`, mica uses that exact file.
 
 ## Repo Override for Init
