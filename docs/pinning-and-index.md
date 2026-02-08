@@ -42,6 +42,7 @@ Useful commands:
 ```bash
 mica index status
 mica index rebuild /tmp/nixpkgs.json
+mica index rebuild-local ~/dev/jpetrucciani-nix --skip-attr home-packages,watcher --show-trace
 mica index fetch
 ```
 

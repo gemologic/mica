@@ -254,6 +254,22 @@ enum IndexCommand {
         #[arg(long, help = "Output path for the index db")]
         output: Option<PathBuf>,
     },
+    #[command(about = "Evaluate a local nix repo and rebuild index")]
+    RebuildLocal {
+        #[arg(help = "Path to local nix repo root")]
+        repo: PathBuf,
+        #[arg(long, help = "Output path for the index db")]
+        output: Option<PathBuf>,
+        #[arg(
+            long = "skip-attr",
+            value_name = "ATTR_OR_GLOB",
+            value_delimiter = ',',
+            help = "Extra attrs/globs to skip (in addition to defaults and MICA_NIX_SKIP_ATTRS)"
+        )]
+        skip_attr: Vec<String>,
+        #[arg(long, help = "Enable --show-trace for nix evaluation")]
+        show_trace: bool,
+    },
     #[command(about = "Fetch remote index")]
     Fetch,
 }
@@ -895,6 +911,26 @@ fn run() -> Result<(), CliError> {
                     };
                     let count =
                         rebuild_index_from_json(&output, &input, &output_path, pin.as_ref())?;
+                    output.info(format!("indexed {} packages", count));
+                }
+                IndexCommand::RebuildLocal {
+                    repo,
+                    output: output_path_override,
+                    skip_attr,
+                    show_trace,
+                } => {
+                    if cli.dry_run {
+                        output.info("dry-run: skipping local index rebuild");
+                        return Ok(());
+                    }
+                    let output_path = output_path_override.unwrap_or(index_db_path()?);
+                    let count = rebuild_index_from_local_repo_with_spinner(
+                        &output,
+                        &repo,
+                        &output_path,
+                        &skip_attr,
+                        show_trace,
+                    )?;
                     output.info(format!("indexed {} packages", count));
                 }
                 IndexCommand::Fetch => {
@@ -3617,6 +3653,19 @@ fn rebuild_index_from_json(
     rebuild_index_with_packages(output_path, &packages, pin, index_has_meta)
 }
 
+fn rebuild_index_from_local_repo(
+    output: &Output,
+    repo_path: &Path,
+    output_path: &Path,
+    extra_skip: &[String],
+    show_trace: bool,
+) -> Result<usize, CliError> {
+    let mut packages = load_packages_from_local_repo(output, repo_path, extra_skip, show_trace)?;
+    normalize_attr_paths(&mut packages);
+    let index_has_meta = packages_have_meta(&packages);
+    rebuild_index_with_packages(output_path, &packages, None, index_has_meta)
+}
+
 fn rebuild_index_from_pins(
     output: &Output,
     output_path: &Path,
@@ -3684,6 +3733,18 @@ fn rebuild_index_from_pins_with_spinner(
 ) -> Result<usize, CliError> {
     run_with_spinner(output, "building index", || {
         rebuild_index_from_pins(output, output_path, pins)
+    })
+}
+
+fn rebuild_index_from_local_repo_with_spinner(
+    output: &Output,
+    repo_path: &Path,
+    output_path: &Path,
+    extra_skip: &[String],
+    show_trace: bool,
+) -> Result<usize, CliError> {
+    run_with_spinner(output, "building index", || {
+        rebuild_index_from_local_repo(output, repo_path, output_path, extra_skip, show_trace)
     })
 }
 
@@ -3806,20 +3867,58 @@ fn maybe_refresh_remote_index(
     Ok(fetched)
 }
 
-fn load_packages_from_pin(
-    output: &Output,
-    pin: &Pin,
-) -> Result<Vec<mica_index::generate::NixPackage>, CliError> {
-    let expr_path = temp_index_nix_path();
-    let json_path = temp_index_json_path();
+fn index_skip_overrides(extra: &[String]) -> Vec<String> {
     let mut skip = parse_skip_list(
         std::env::var("MICA_NIX_SKIP_ATTRS")
             .unwrap_or_default()
             .as_str(),
     );
+    for entry in extra {
+        if !skip.iter().any(|existing| existing == entry) {
+            skip.push(entry.clone());
+        }
+    }
+    skip.sort();
+    skip.dedup();
+    skip
+}
+
+fn load_packages_from_pin(
+    output: &Output,
+    pin: &Pin,
+) -> Result<Vec<mica_index::generate::NixPackage>, CliError> {
+    let skip = index_skip_overrides(&[]);
+    load_packages_from_nix_expression(output, skip, nix_env_show_trace(), |all_skip| {
+        nix_env_expression(pin, all_skip)
+    })
+}
+
+fn load_packages_from_local_repo(
+    output: &Output,
+    repo_path: &Path,
+    extra_skip: &[String],
+    show_trace: bool,
+) -> Result<Vec<mica_index::generate::NixPackage>, CliError> {
+    let repo_path = std::fs::canonicalize(repo_path).map_err(CliError::ReadNix)?;
+    let skip = index_skip_overrides(extra_skip);
+    load_packages_from_nix_expression(
+        output,
+        skip,
+        show_trace || nix_env_show_trace(),
+        |all_skip| nix_env_expression_from_local_repo(&repo_path, all_skip),
+    )
+}
+
+fn load_packages_from_nix_expression(
+    output: &Output,
+    mut skip: Vec<String>,
+    mut use_show_trace: bool,
+    expression_builder: impl Fn(&[String]) -> String,
+) -> Result<Vec<mica_index::generate::NixPackage>, CliError> {
+    let expr_path = temp_index_nix_path();
+    let json_path = temp_index_json_path();
     let mut attempts = 0usize;
     let max_attempts = 12usize;
-    let mut use_show_trace = nix_env_show_trace();
     loop {
         attempts += 1;
         let skipped_label = if skip.is_empty() {
@@ -3838,8 +3937,7 @@ fn load_packages_from_pin(
             all_skip.join(",")
         };
         output.verbose(format!("index skip list: {}", all_skip_label));
-        std::fs::write(&expr_path, nix_env_expression(pin, &all_skip))
-            .map_err(CliError::WriteNix)?;
+        std::fs::write(&expr_path, expression_builder(&all_skip)).map_err(CliError::WriteNix)?;
 
         let file = std::fs::File::create(&json_path).map_err(CliError::WriteNix)?;
         let mut args = vec![
@@ -4008,8 +4106,18 @@ fn nix_env_expression(pin: &Pin, skip: &[String]) -> String {
       sha256 = nixpkgsLocked.narHash;
     }}
     else src;
-  baseAttempt = builtins.tryEval (import src {{ }});
-  baseFallback = import nixpkgsSrc {{ }};
+  baseAttempt =
+    let imported = import src;
+    in builtins.tryEval (
+      if builtins.isFunction imported
+      then imported {{ }}
+      else imported
+    );
+  baseFallback =
+    let imported = import nixpkgsSrc;
+    in if builtins.isFunction imported
+      then imported {{ }}
+      else imported;
   base = if baseAttempt.success then baseAttempt.value else baseFallback;
   isAttrSet = v: builtins.typeOf v == "set";
   isDerivation = v: isAttrSet v && v ? type && v.type == "derivation";
@@ -4042,6 +4150,80 @@ in sanitize pkgs
 "#,
         url = url,
         sha256 = pin.sha256,
+        skip_list = skip_list
+    )
+}
+
+fn nix_env_expression_from_local_repo(repo_path: &Path, skip: &[String]) -> String {
+    let repo_path = escape_nix_string(repo_path.to_string_lossy().as_ref());
+    let skip_regex: Vec<String> = skip.iter().map(|entry| glob_to_regex(entry)).collect();
+    let skip_list = nix_string_list(&skip_regex);
+    format!(
+        r#"let
+  src = builtins.toPath "{repo_path}";
+  lockPath = src + "/flake.lock";
+  lock = if builtins.pathExists lockPath
+    then builtins.fromJSON (builtins.readFile lockPath)
+    else null;
+  nixpkgsLocked = if lock != null
+    && lock ? nodes
+    && lock.nodes ? nixpkgs
+    && lock.nodes.nixpkgs ? locked
+    then lock.nodes.nixpkgs.locked
+    else null;
+  nixpkgsSrc = if nixpkgsLocked != null
+    && nixpkgsLocked ? owner
+    && nixpkgsLocked ? repo
+    && nixpkgsLocked ? rev
+    && nixpkgsLocked ? narHash
+    then builtins.fetchTarball {{
+      url = "https://github.com/${{nixpkgsLocked.owner}}/${{nixpkgsLocked.repo}}/archive/${{nixpkgsLocked.rev}}.tar.gz";
+      sha256 = nixpkgsLocked.narHash;
+    }}
+    else src;
+  baseAttempt =
+    let imported = import src;
+    in builtins.tryEval (
+      if builtins.isFunction imported
+      then imported {{ }}
+      else imported
+    );
+  baseFallback =
+    let imported = import nixpkgsSrc;
+    in if builtins.isFunction imported
+      then imported {{ }}
+      else imported;
+  base = if baseAttempt.success then baseAttempt.value else baseFallback;
+  isAttrSet = v: builtins.typeOf v == "set";
+  isDerivation = v: isAttrSet v && v ? type && v.type == "derivation";
+  pkgs = if base != null && isAttrSet base && base ? pkgs
+    then base.pkgs
+    else if base != null && isAttrSet base
+    then base
+    else baseFallback;
+  sanitize = attrs:
+    if attrs == null || !isAttrSet attrs
+      then {{ }}
+      else
+        let namesAttempt = builtins.tryEval (builtins.attrNames attrs);
+            skip = {skip_list};
+            matchesSkip = name:
+              builtins.any (pattern: builtins.match pattern name != null) skip;
+            names = if namesAttempt.success
+              then builtins.filter (name: !(matchesSkip name)) namesAttempt.value
+              else [];
+        in builtins.foldl' (acc: name:
+             let attempt = builtins.tryEval attrs.${{name}};
+             in if !attempt.success then acc
+                else if isDerivation attempt.value
+                  then acc // {{ ${{name}} = attempt.value; }}
+                else if isAttrSet attempt.value
+                  then acc // {{ ${{name}} = sanitize attempt.value; }}
+                else acc
+           ) {{ }} names;
+in sanitize pkgs
+"#,
+        repo_path = repo_path,
         skip_list = skip_list
     )
 }
@@ -5667,9 +5849,11 @@ mod tests {
     use crate::{
         encode_env_editor_value, env_value_for_editor, env_value_mode_from_stored,
         parse_github_repo, should_retry_default_branch_lookup, Cli, CliError, Command,
+        IndexCommand,
     };
     use clap::Parser;
     use mica_core::state::NIX_EXPR_PREFIX;
+    use std::path::PathBuf;
 
     #[test]
     fn parse_github_repo_https() {
@@ -5703,6 +5887,36 @@ mod tests {
     fn cli_parses_presets_subcommand() {
         let cli = Cli::try_parse_from(["mica", "presets"]).expect("parse failed");
         assert!(matches!(cli.command, Some(Command::Presets)));
+    }
+
+    #[test]
+    fn cli_parses_index_rebuild_local_subcommand() {
+        let cli = Cli::try_parse_from([
+            "mica",
+            "index",
+            "rebuild-local",
+            "/tmp/nix",
+            "--skip-attr",
+            "foo,bar",
+            "--show-trace",
+        ])
+        .expect("parse failed");
+        match cli.command {
+            Some(Command::Index { command }) => match command {
+                IndexCommand::RebuildLocal {
+                    repo,
+                    skip_attr,
+                    show_trace,
+                    ..
+                } => {
+                    assert_eq!(repo, PathBuf::from("/tmp/nix"));
+                    assert_eq!(skip_attr, vec!["foo".to_string(), "bar".to_string()]);
+                    assert!(show_trace);
+                }
+                _ => panic!("expected rebuild-local"),
+            },
+            _ => panic!("expected index command"),
+        }
     }
 
     #[test]

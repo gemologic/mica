@@ -60,6 +60,7 @@ A TUI for managing Nix environments. Mica lets you search packages, apply preset
 - `mica diff` show drift between state and `default.nix`
 - `mica sync` regenerate `default.nix` from state
 - `mica index rebuild /tmp/nixpkgs.json`
+- `mica index rebuild-local ~/dev/jpetrucciani-nix --skip-attr home-manager --show-trace`
 
 **Configuration**
 Config lives at `~/.config/mica/config.toml`.

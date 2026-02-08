@@ -19,6 +19,12 @@ Try:
 MICA_NIX_SHOW_TRACE=1 mica index rebuild /tmp/nixpkgs.json
 ```
 
+For local repo evaluation with built-in retry/skip behavior:
+
+```bash
+mica index rebuild-local ~/dev/jpetrucciani-nix --skip-attr home-packages,watcher --show-trace
+```
+
 For pin-driven rebuild diagnostics:
 
 ```bash
@@ -54,4 +60,3 @@ mica list
 mica diff
 mica export
 ```
-
