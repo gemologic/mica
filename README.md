@@ -96,7 +96,7 @@ Mica ships with bundled presets in `presets/` and can load extra preset director
 **Development**
 - `direnv exec . cargo run -p mica -- tui`
 - `direnv exec . cargo fmt`
-- `direnv exec . cargo clippy --all --benches --tests --examples --all-features`
+- `direnv exec . cargo clippy --all --benches --tests --examples --all-features -- -D warnings -W clippy::collapsible_else_if`
 
 **Docs (VitePress + bun)**
 - `bun install`

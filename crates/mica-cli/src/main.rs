@@ -1226,12 +1226,10 @@ fn run_tui_loop_project(
                     ) {
                         app.push_toast(tui::app::ToastLevel::Error, err.to_string());
                     }
-                } else {
-                    if let Err(err) =
-                        handle_main_key(key, terminal, app, state, paths, index_path, conn, output)
-                    {
-                        app.push_toast(tui::app::ToastLevel::Error, err.to_string());
-                    }
+                } else if let Err(err) =
+                    handle_main_key(key, terminal, app, state, paths, index_path, conn, output)
+                {
+                    app.push_toast(tui::app::ToastLevel::Error, err.to_string());
                 }
             }
         }
