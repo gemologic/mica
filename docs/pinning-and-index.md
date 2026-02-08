@@ -37,6 +37,13 @@ Mica maintains a local SQLite index at:
 
 `~/.config/mica/cache/index.db`
 
+When `index.remote_url` is configured as a base URL, mica tries:
+
+1. `<remote_url>/<nixpkgs_commit>.db`
+2. `<remote_url>/index.db`
+
+If neither exists, mica falls back to rebuilding locally.
+
 Useful commands:
 
 ```bash

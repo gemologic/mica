@@ -15,7 +15,7 @@ default_branch = "main"
 extra_dirs = ["~/my-presets"]
 
 [index]
-remote_url = "https://example.com/mica-index"
+remote_url = "https://static.g7c.us/mica"
 update_check_interval = 24
 
 [tui]
@@ -30,10 +30,14 @@ platforms = false
 main_program = false
 ```
 
+`index.remote_url` behavior:
+
+- If it is a base URL, mica tries `REMOTE/<nixpkgs_commit>.db` first, then `REMOTE/index.db`.
+- If it already ends in `.db`, mica uses that exact file.
+
 ## Repo Override for Init
 
 You can override the repo used by `mica init`:
 
 - CLI: `mica init --repo <url>`
 - Environment: `MICA_NIXPKGS_REPO=<url>`
-

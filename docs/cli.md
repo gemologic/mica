@@ -91,6 +91,8 @@ mica index rebuild-local ~/dev/jpetrucciani-nix --skip-attr home-packages,watche
 mica index fetch
 ```
 
+With `index.remote_url` set to a base URL, mica fetches `<remote>/<nixpkgs_commit>.db` first, then falls back to `<remote>/index.db`.
+
 ## Validation and Drift
 
 ```bash

@@ -78,7 +78,7 @@ pub struct IndexSection {
 impl Default for IndexSection {
     fn default() -> Self {
         IndexSection {
-            remote_url: String::new(),
+            remote_url: "https://static.g7c.us/mica".to_string(),
             update_check_interval: 24,
         }
     }
@@ -152,5 +152,11 @@ mod tests {
         let toml = toml::to_string(&config).expect("serialize failed");
         let decoded: Config = toml::from_str(&toml).expect("deserialize failed");
         assert_eq!(config, decoded);
+    }
+
+    #[test]
+    fn default_config_has_remote_index_url() {
+        let config = Config::default();
+        assert_eq!(config.index.remote_url, "https://static.g7c.us/mica");
     }
 }

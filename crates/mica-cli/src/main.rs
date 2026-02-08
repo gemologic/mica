@@ -943,7 +943,36 @@ fn run() -> Result<(), CliError> {
                         return Err(CliError::MissingRemoteIndex);
                     }
                     let index_path = index_db_path()?;
-                    fetch_remote_index(&config.index.remote_url, &index_path)?;
+                    let pins = if cli.global {
+                        load_profile_state()
+                            .ok()
+                            .map(|state| collect_index_pins_profile(&state))
+                    } else {
+                        project_paths.as_ref().and_then(|paths| {
+                            load_project_state(paths)
+                                .ok()
+                                .map(|state| collect_index_pins(&state))
+                        })
+                    };
+                    let fetched = try_fetch_remote_index(
+                        &output,
+                        &config.index.remote_url,
+                        &index_path,
+                        pins.as_ref().and_then(|entries| primary_pin_rev(entries)),
+                    )?;
+                    if !fetched {
+                        let Some(pins) = pins.as_ref() else {
+                            return Err(CliError::RemoteIndexFailed(
+                                reqwest::StatusCode::NOT_FOUND,
+                                "no remote index found and no local state available for rebuild"
+                                    .to_string(),
+                            ));
+                        };
+                        output.status("remote index unavailable, rebuilding locally");
+                        let count =
+                            rebuild_index_from_pins_with_spinner(&output, &index_path, pins)?;
+                        output.info(format!("indexed {} packages", count));
+                    }
                     output.info(format!("index fetched to {}", index_path.display()));
                     if let Ok(conn) = open_db(&index_path) {
                         if let Ok(meta) = get_meta(&conn) {
@@ -1033,25 +1062,20 @@ fn run_tui_project(paths: &ProjectPaths, output: &Output) -> Result<(), CliError
     let config = load_config_or_default().ok();
     let index_path = index_db_path()?;
     if !index_path.exists() {
-        let mut fetched = false;
-        if let Some(config) = &config {
-            fetched = try_fetch_remote_index(output, &config.index.remote_url, &index_path)?;
-            if !config.index.remote_url.trim().is_empty() {
-                record_index_check_time(output);
-            }
-        }
+        let pins = collect_index_pins(&state);
+        let fetched = try_fetch_remote_index_for_pins(output, config.as_ref(), &index_path, &pins)?;
         if !fetched {
             output.status(format!(
                 "index missing at {}, building from nix-env -qaP --json",
                 index_path.display()
             ));
-            let pins = collect_index_pins(&state);
             let count = rebuild_index_from_pins_with_spinner(output, &index_path, &pins)?;
             output.status(format!("index ready, {} packages", count));
         }
     }
     if let Some(config) = &config {
-        let _ = maybe_refresh_remote_index(output, config, &index_path)?;
+        let pins = collect_index_pins(&state);
+        let _ = maybe_refresh_remote_index(output, config, &index_path, primary_pin_rev(&pins))?;
     }
 
     let mut conn = open_db(&index_path)?;
@@ -1061,13 +1085,8 @@ fn run_tui_project(paths: &ProjectPaths, output: &Output) -> Result<(), CliError
         has_meta = false;
     }
     if !has_meta {
-        let mut fetched = false;
-        if let Some(config) = &config {
-            fetched = try_fetch_remote_index(output, &config.index.remote_url, &index_path)?;
-            if !config.index.remote_url.trim().is_empty() {
-                record_index_check_time(output);
-            }
-        }
+        let pins = collect_index_pins(&state);
+        let fetched = try_fetch_remote_index_for_pins(output, config.as_ref(), &index_path, &pins)?;
         if fetched {
             conn = open_db(&index_path)?;
             meta = get_meta(&conn).unwrap_or_default();
@@ -1078,7 +1097,6 @@ fn run_tui_project(paths: &ProjectPaths, output: &Output) -> Result<(), CliError
         }
         if !has_meta {
             output.status("index missing metadata, rebuilding from nix-env -qaP --json --meta");
-            let pins = collect_index_pins(&state);
             let count = rebuild_index_from_pins_with_spinner(output, &index_path, &pins)?;
             output.status(format!("index ready, {} packages", count));
             conn = open_db(&index_path)?;
@@ -1094,7 +1112,8 @@ fn run_tui_project(paths: &ProjectPaths, output: &Output) -> Result<(), CliError
         apply_search_mode_from_config(&mut app, config);
         apply_show_details_from_config(&mut app, config);
     }
-    app.index_info = index_info_from_meta(meta);
+    let pins = collect_index_pins(&state);
+    app.index_info = index_info_with_pin_fallback(index_info_from_meta(meta), &pins);
     apply_state_to_app(&mut app, &state);
     update_search_results(&conn, &mut app)?;
     app.refresh_preset_filter();
@@ -1149,25 +1168,20 @@ fn run_tui_global(output: &Output) -> Result<(), CliError> {
     let config = load_config_or_default().ok();
     let index_path = index_db_path()?;
     if !index_path.exists() {
-        let mut fetched = false;
-        if let Some(config) = &config {
-            fetched = try_fetch_remote_index(output, &config.index.remote_url, &index_path)?;
-            if !config.index.remote_url.trim().is_empty() {
-                record_index_check_time(output);
-            }
-        }
+        let pins = collect_index_pins_profile(&state);
+        let fetched = try_fetch_remote_index_for_pins(output, config.as_ref(), &index_path, &pins)?;
         if !fetched {
             output.status(format!(
                 "index missing at {}, building from nix-env -qaP --json",
                 index_path.display()
             ));
-            let pins = collect_index_pins_profile(&state);
             let count = rebuild_index_from_pins_with_spinner(output, &index_path, &pins)?;
             output.status(format!("index ready, {} packages", count));
         }
     }
     if let Some(config) = &config {
-        let _ = maybe_refresh_remote_index(output, config, &index_path)?;
+        let pins = collect_index_pins_profile(&state);
+        let _ = maybe_refresh_remote_index(output, config, &index_path, primary_pin_rev(&pins))?;
     }
 
     let mut conn = open_db(&index_path)?;
@@ -1177,13 +1191,8 @@ fn run_tui_global(output: &Output) -> Result<(), CliError> {
         has_meta = false;
     }
     if !has_meta {
-        let mut fetched = false;
-        if let Some(config) = &config {
-            fetched = try_fetch_remote_index(output, &config.index.remote_url, &index_path)?;
-            if !config.index.remote_url.trim().is_empty() {
-                record_index_check_time(output);
-            }
-        }
+        let pins = collect_index_pins_profile(&state);
+        let fetched = try_fetch_remote_index_for_pins(output, config.as_ref(), &index_path, &pins)?;
         if fetched {
             conn = open_db(&index_path)?;
             meta = get_meta(&conn).unwrap_or_default();
@@ -1194,7 +1203,6 @@ fn run_tui_global(output: &Output) -> Result<(), CliError> {
         }
         if !has_meta {
             output.status("index missing metadata, rebuilding from nix-env -qaP --json --meta");
-            let pins = collect_index_pins_profile(&state);
             let count = rebuild_index_from_pins_with_spinner(output, &index_path, &pins)?;
             output.status(format!("index ready, {} packages", count));
             conn = open_db(&index_path)?;
@@ -1210,7 +1218,8 @@ fn run_tui_global(output: &Output) -> Result<(), CliError> {
         apply_search_mode_from_config(&mut app, config);
         apply_show_details_from_config(&mut app, config);
     }
-    app.index_info = index_info_from_meta(meta);
+    let pins = collect_index_pins_profile(&state);
+    app.index_info = index_info_with_pin_fallback(index_info_from_meta(meta), &pins);
     apply_profile_state_to_app(&mut app, &state);
     update_search_results(&conn, &mut app)?;
     app.refresh_preset_filter();
@@ -1424,11 +1433,20 @@ fn handle_main_key(
                 update_project_modified(state);
                 save_project_state(paths, state)?;
                 let pins = collect_index_pins(state);
-                rebuild_index_from_pins_with_spinner(output, index_path, &pins)?;
+                let config = load_config_or_default().ok();
+                let fetched =
+                    try_fetch_remote_index_for_pins(output, config.as_ref(), index_path, &pins)?;
+                if !fetched {
+                    rebuild_index_from_pins_with_spinner(output, index_path, &pins)?;
+                }
                 Ok(())
             })?;
             *conn = open_db(index_path)?;
-            app.index_info = index_info_from_meta(get_meta(conn).unwrap_or_default());
+            let pins = collect_index_pins(state);
+            app.index_info = index_info_with_pin_fallback(
+                index_info_from_meta(get_meta(conn).unwrap_or_default()),
+                &pins,
+            );
             update_search_results(conn, app)?;
             app.push_toast(tui::app::ToastLevel::Info, "Pin updated");
         }
@@ -1455,11 +1473,20 @@ fn handle_main_key(
         InputAction::RebuildIndex => {
             with_tui_suspended(terminal, || {
                 let pins = collect_index_pins(state);
-                rebuild_index_from_pins_with_spinner(output, index_path, &pins)?;
+                let config = load_config_or_default().ok();
+                let fetched =
+                    try_fetch_remote_index_for_pins(output, config.as_ref(), index_path, &pins)?;
+                if !fetched {
+                    rebuild_index_from_pins_with_spinner(output, index_path, &pins)?;
+                }
                 Ok(())
             })?;
             *conn = open_db(index_path)?;
-            app.index_info = index_info_from_meta(get_meta(conn).unwrap_or_default());
+            let pins = collect_index_pins(state);
+            app.index_info = index_info_with_pin_fallback(
+                index_info_from_meta(get_meta(conn).unwrap_or_default()),
+                &pins,
+            );
             update_search_results(conn, app)?;
             app.push_toast(tui::app::ToastLevel::Info, "Index rebuilt");
         }
@@ -1623,11 +1650,20 @@ fn handle_main_key_global(
                 save_profile_state(state)?;
                 sync_and_install_profile(output, state)?;
                 let pins = collect_index_pins_profile(state);
-                rebuild_index_from_pins_with_spinner(output, index_path, &pins)?;
+                let config = load_config_or_default().ok();
+                let fetched =
+                    try_fetch_remote_index_for_pins(output, config.as_ref(), index_path, &pins)?;
+                if !fetched {
+                    rebuild_index_from_pins_with_spinner(output, index_path, &pins)?;
+                }
                 Ok(())
             })?;
             *conn = open_db(index_path)?;
-            app.index_info = index_info_from_meta(get_meta(conn).unwrap_or_default());
+            let pins = collect_index_pins_profile(state);
+            app.index_info = index_info_with_pin_fallback(
+                index_info_from_meta(get_meta(conn).unwrap_or_default()),
+                &pins,
+            );
             update_search_results(conn, app)?;
             app.push_toast(tui::app::ToastLevel::Info, "Pin updated");
         }
@@ -1651,11 +1687,20 @@ fn handle_main_key_global(
         InputAction::RebuildIndex => {
             with_tui_suspended(terminal, || {
                 let pins = collect_index_pins_profile(state);
-                rebuild_index_from_pins_with_spinner(output, index_path, &pins)?;
+                let config = load_config_or_default().ok();
+                let fetched =
+                    try_fetch_remote_index_for_pins(output, config.as_ref(), index_path, &pins)?;
+                if !fetched {
+                    rebuild_index_from_pins_with_spinner(output, index_path, &pins)?;
+                }
                 Ok(())
             })?;
             *conn = open_db(index_path)?;
-            app.index_info = index_info_from_meta(get_meta(conn).unwrap_or_default());
+            let pins = collect_index_pins_profile(state);
+            app.index_info = index_info_with_pin_fallback(
+                index_info_from_meta(get_meta(conn).unwrap_or_default()),
+                &pins,
+            );
             update_search_results(conn, app)?;
             app.push_toast(tui::app::ToastLevel::Info, "Index rebuilt");
         }
@@ -2468,7 +2513,11 @@ fn submit_pin_editor(
         )?;
         save_project_state(paths, state)?;
         let pins = collect_index_pins(state);
-        rebuild_index_from_pins_with_spinner(output, index_path, &pins)?;
+        let config = load_config_or_default().ok();
+        let fetched = try_fetch_remote_index_for_pins(output, config.as_ref(), index_path, &pins)?;
+        if !fetched {
+            rebuild_index_from_pins_with_spinner(output, index_path, &pins)?;
+        }
         Ok(())
     }) {
         editor.error = Some(err.to_string());
@@ -2478,7 +2527,11 @@ fn submit_pin_editor(
     match open_db(index_path) {
         Ok(new_conn) => {
             *conn = new_conn;
-            app.index_info = index_info_from_meta(get_meta(conn).unwrap_or_default());
+            let pins = collect_index_pins(state);
+            app.index_info = index_info_with_pin_fallback(
+                index_info_from_meta(get_meta(conn).unwrap_or_default()),
+                &pins,
+            );
             if let Err(err) = update_search_results(conn, app) {
                 app.push_toast(tui::app::ToastLevel::Error, err.to_string());
             }
@@ -3173,6 +3226,27 @@ fn index_info_from_meta(meta: Vec<(String, String)>) -> tui::app::IndexInfo {
     info
 }
 
+fn index_info_unknown(value: &str) -> bool {
+    let trimmed = value.trim();
+    trimmed.is_empty() || trimmed.eq_ignore_ascii_case("unknown")
+}
+
+fn index_info_with_pin_fallback(
+    mut info: tui::app::IndexInfo,
+    pins: &[IndexPin],
+) -> tui::app::IndexInfo {
+    let Some(primary) = pins.first() else {
+        return info;
+    };
+    if index_info_unknown(&info.url) {
+        info.url = primary.pin.url.clone();
+    }
+    if index_info_unknown(&info.rev) {
+        info.rev = primary.pin.rev.clone();
+    }
+    info
+}
+
 fn meta_has_key(meta: &[(String, String)], needle: &str) -> bool {
     meta.iter()
         .any(|(key, value)| key == needle && value == "true")
@@ -3748,22 +3822,25 @@ fn rebuild_index_from_local_repo_with_spinner(
     })
 }
 
-fn resolve_remote_index_url(remote_url: &str) -> Option<String> {
+fn resolve_remote_index_urls(remote_url: &str, commit: Option<&str>) -> Vec<String> {
     let trimmed = remote_url.trim();
     if trimmed.is_empty() {
-        return None;
+        return Vec::new();
     }
     if trimmed.ends_with(".db") {
-        Some(trimmed.to_string())
-    } else {
-        Some(format!("{}/index.db", trimmed.trim_end_matches('/')))
+        return vec![trimmed.to_string()];
     }
+    let base = trimmed.trim_end_matches('/');
+    let mut urls = Vec::new();
+    if let Some(commit) = commit.map(str::trim).filter(|value| !value.is_empty()) {
+        urls.push(format!("{}/{}.db", base, commit));
+    }
+    urls
 }
 
-fn fetch_remote_index(remote_url: &str, output_path: &Path) -> Result<(), CliError> {
-    let url = resolve_remote_index_url(remote_url).ok_or(CliError::MissingRemoteIndex)?;
+fn fetch_remote_index_url(url: &str, output_path: &Path) -> Result<(), CliError> {
     let client = Client::builder().timeout(Duration::from_secs(30)).build()?;
-    let response = client.get(&url).send()?;
+    let response = client.get(url).send()?;
     let status = response.status();
     if !status.is_success() {
         let body = response.text().unwrap_or_default();
@@ -3783,21 +3860,64 @@ fn try_fetch_remote_index(
     output: &Output,
     remote_url: &str,
     output_path: &Path,
+    commit: Option<&str>,
 ) -> Result<bool, CliError> {
-    let Some(url) = resolve_remote_index_url(remote_url) else {
+    let urls = resolve_remote_index_urls(remote_url, commit);
+    if urls.is_empty() {
         return Ok(false);
-    };
-    output.status(format!("fetching remote index from {}", url));
-    match fetch_remote_index(remote_url, output_path) {
-        Ok(()) => {
-            output.status("remote index fetched");
-            Ok(true)
-        }
-        Err(err) => {
-            output.warn(format!("remote index fetch failed: {}", err));
-            Ok(false)
+    }
+
+    let mut last_error: Option<CliError> = None;
+    for url in urls {
+        output.status(format!("fetching remote index from {}", url));
+        match fetch_remote_index_url(&url, output_path) {
+            Ok(()) => {
+                output.status("remote index fetched");
+                return Ok(true);
+            }
+            Err(CliError::RemoteIndexFailed(status, _))
+                if status == reqwest::StatusCode::NOT_FOUND =>
+            {
+                output.verbose(format!("remote index not found at {}", url));
+            }
+            Err(err) => {
+                output.verbose(format!("remote index fetch failed at {}: {}", url, err));
+                last_error = Some(err);
+            }
         }
     }
+
+    if let Some(err) = last_error {
+        output.warn(format!("remote index fetch failed: {}", err));
+    }
+    Ok(false)
+}
+
+fn primary_pin_rev(pins: &[IndexPin]) -> Option<&str> {
+    pins.first()
+        .map(|entry| entry.pin.rev.trim())
+        .filter(|value| !value.is_empty())
+}
+
+fn try_fetch_remote_index_for_pins(
+    output: &Output,
+    config: Option<&Config>,
+    index_path: &Path,
+    pins: &[IndexPin],
+) -> Result<bool, CliError> {
+    let Some(config) = config else {
+        return Ok(false);
+    };
+    let fetched = try_fetch_remote_index(
+        output,
+        &config.index.remote_url,
+        index_path,
+        primary_pin_rev(pins),
+    )?;
+    if !config.index.remote_url.trim().is_empty() {
+        record_index_check_time(output);
+    }
+    Ok(fetched)
 }
 
 fn index_check_path() -> Result<PathBuf, CliError> {
@@ -3857,12 +3977,13 @@ fn maybe_refresh_remote_index(
     output: &Output,
     config: &Config,
     index_path: &Path,
+    commit: Option<&str>,
 ) -> Result<bool, CliError> {
     if !should_check_remote_index(config)? {
         return Ok(false);
     }
     output.status("checking remote index for updates");
-    let fetched = try_fetch_remote_index(output, &config.index.remote_url, index_path)?;
+    let fetched = try_fetch_remote_index(output, &config.index.remote_url, index_path, commit)?;
     record_index_check_time(output);
     Ok(fetched)
 }
@@ -5848,9 +5969,10 @@ fn print_profile_state(output: &Output, state: &GlobalProfileState) {
 mod tests {
     use crate::{
         encode_env_editor_value, env_value_for_editor, env_value_mode_from_stored,
-        parse_github_repo, should_retry_default_branch_lookup, Cli, CliError, Command,
-        IndexCommand,
+        parse_github_repo, resolve_remote_index_urls, should_retry_default_branch_lookup, Cli,
+        CliError, Command, IndexCommand,
     };
+    use chrono::NaiveDate;
     use clap::Parser;
     use mica_core::state::NIX_EXPR_PREFIX;
     use std::path::PathBuf;
@@ -5917,6 +6039,53 @@ mod tests {
             },
             _ => panic!("expected index command"),
         }
+    }
+
+    #[test]
+    fn resolve_remote_index_urls_prefers_commit_then_fallback() {
+        let urls = resolve_remote_index_urls("https://static.g7c.us/mica", Some("abcd1234"));
+        assert_eq!(
+            urls,
+            vec![
+                "https://static.g7c.us/mica/abcd1234.db".to_string(),
+                "https://static.g7c.us/mica/index.db".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_remote_index_urls_keeps_explicit_db_url() {
+        let urls = resolve_remote_index_urls("https://static.g7c.us/mica/index.db", Some("abcd"));
+        assert_eq!(
+            urls,
+            vec!["https://static.g7c.us/mica/index.db".to_string()]
+        );
+    }
+
+    #[test]
+    fn index_info_falls_back_to_primary_pin_when_meta_is_unknown() {
+        let info = crate::tui::app::IndexInfo {
+            url: "unknown".to_string(),
+            rev: "unknown".to_string(),
+            count: None,
+            generated_at: None,
+            displayed_count: None,
+        };
+        let pins = vec![crate::IndexPin {
+            name: None,
+            pin: mica_core::state::Pin {
+                name: None,
+                url: "https://github.com/jpetrucciani/nix".to_string(),
+                rev: "004391ff727d67a4f2e41590b0e8430a306d6688".to_string(),
+                sha256: "sha256-test".to_string(),
+                branch: "main".to_string(),
+                updated: NaiveDate::from_ymd_opt(2026, 2, 8).expect("valid date"),
+            },
+        }];
+
+        let merged = crate::index_info_with_pin_fallback(info, &pins);
+        assert_eq!(merged.url, "https://github.com/jpetrucciani/nix");
+        assert_eq!(merged.rev, "004391ff727d67a4f2e41590b0e8430a306d6688");
     }
 
     #[test]

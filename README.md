@@ -74,12 +74,14 @@ default_branch = "main"
 extra_dirs = ["~/my-presets"]
 
 [index]
-remote_url = "https://example.com/mica-index"
+remote_url = "https://static.g7c.us/mica"
 update_check_interval = 24
 
 [tui]
 show_details = true
 ```
+
+For `index.remote_url`, mica tries `<remote>/<nixpkgs_commit>.db`.
 
 You can also override the repo for `mica init` with `--repo` or `MICA_NIXPKGS_REPO`.
 
