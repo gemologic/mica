@@ -4,7 +4,7 @@
 
 ```text
 tui, init, list, presets, add, remove, search, env, shell,
-apply, unapply, update, pin, generations, export, index, sync, eval, diff
+apply, unapply, update, pin, generations, export, index, sync, eval, diff, completion
 ```
 
 See full help:
@@ -109,4 +109,12 @@ mica --global list
 mica --global add ripgrep
 mica --global generations list
 mica --global generations rollback
+```
+
+## Shell Completions
+
+```bash
+mica completion bash
+mica completion zsh
+mica completion fish
 ```

@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::{generate, Shell};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use mica_core::config::Config;
 use mica_core::nixgen::{generate_profile_nix, generate_project_nix};
@@ -170,6 +171,11 @@ enum Command {
     Eval,
     #[command(about = "Check for drift between state and nix file")]
     Diff,
+    #[command(about = "Generate shell completion script")]
+    Completion {
+        #[arg(value_enum, help = "Target shell")]
+        shell: Shell,
+    },
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -1024,6 +1030,11 @@ fn run() -> Result<(), CliError> {
                 let state = load_project_state(paths)?;
                 diff_project(&output, paths, &state)?;
             }
+            Ok(())
+        }
+        Command::Completion { shell } => {
+            let mut cmd = Cli::command();
+            generate(shell, &mut cmd, "mica", &mut io::stdout());
             Ok(())
         }
     }
@@ -5974,6 +5985,7 @@ mod tests {
     };
     use chrono::NaiveDate;
     use clap::Parser;
+    use clap_complete::Shell;
     use mica_core::state::NIX_EXPR_PREFIX;
     use std::path::PathBuf;
 
@@ -6039,6 +6051,15 @@ mod tests {
             },
             _ => panic!("expected index command"),
         }
+    }
+
+    #[test]
+    fn cli_parses_completion_subcommand() {
+        let cli = Cli::try_parse_from(["mica", "completion", "zsh"]).expect("parse failed");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Completion { shell: Shell::Zsh })
+        ));
     }
 
     #[test]

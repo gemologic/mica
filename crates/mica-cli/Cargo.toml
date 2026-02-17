@@ -8,6 +8,7 @@ license = { workspace = true }
 mica-core = { path = "../mica-core" }
 mica-index = { path = "../mica-index" }
 clap = { workspace = true }
+clap_complete = { workspace = true }
 chrono = { workspace = true }
 crossterm = { workspace = true }
 ratatui = { workspace = true }
